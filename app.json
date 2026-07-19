@@ -1,7 +1,7 @@
 {
   "expo": {
     "name": "Sound Monitor",
-    "slug": "monitor-app",
+    "slug": "monitor-sound-",
     "version": "1.0.0",
     "orientation": "portrait",
     "userInterfaceStyle": "light",
@@ -25,6 +25,11 @@
           "microphonePermission": "يحتاج هذا التطبيق الوصول للمايكروفون لمراقبة الأصوات."
         }
       ]
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "c6809c58-bf6c-4823-b057-5792dc5032d4"
+      }
+    }
   }
 }
