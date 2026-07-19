@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { View, Text, TouchableOpacity, StyleSheet, Alert } from 'react-native';
+import { View, Text, TouchableOpacity, StyleSheet, Alert, Switch } from 'react-native';
 import { useKeepAwake } from 'expo-keep-awake';
 import ImmediatePhoneCall from 'react-native-immediate-phone-call';
 import {
@@ -8,12 +8,21 @@ import {
   requestAudioPermission,
   configureAudioMode,
 } from '../utils/audioRecorder';
-import { readWavAsSamples, extractSpectralFingerprint, cosineSimilarity } from '../utils/audioFingerprint';
+import {
+  readWavAsSamples,
+  extractSpectralFingerprint,
+  cosineSimilarity,
+  detectKnockPulses,
+} from '../utils/audioFingerprint';
 import { loadReferenceFingerprint, loadPhoneNumber, loadThreshold } from '../utils/storage';
 
-const CONSECUTIVE_MATCHES_NEEDED = 3; // عدد المقاطع المتتالية المطلوب تطابقها
+const CONSECUTIVE_MATCHES_NEEDED = 3; // عدد المقاطع المتتالية المطلوب تطابقها (مسار المنبه)
 const COOLDOWN_MS = 30000; // مهلة قبل السماح باتصال جديد بعد الاتصال السابق
-const CHUNK_DURATION_MS = 1200;
+const CHUNK_DURATION_MS = 2500; // يغطي دورة كاملة (صوت+صمت) مع هامش أمان، بنفس مدة المعايرة
+const SAMPLE_RATE = 16000; // يجب أن يطابق sampleRate في audioRecorder.js
+
+// إعدادات مسار كشف الطرق (لا يحتاج معايرة، يكشف أي نبضة صوت حادة ومفاجئة)
+const KNOCK_MIN_PULSES_PER_CHUNK = 2; // أقل عدد نبضات خلال المقطع الواحد لاعتباره "طرق باب" فعلي
 
 export default function MonitoringScreen({ onBackToSettings }) {
   useKeepAwake();
@@ -22,6 +31,9 @@ export default function MonitoringScreen({ onBackToSettings }) {
   const [status, setStatus] = useState('اضغط "ابدأ المراقبة" للبدء');
   const [lastSimilarity, setLastSimilarity] = useState(0);
   const [callCount, setCallCount] = useState(0);
+  const [lastTrigger, setLastTrigger] = useState(null); // 'alarm' | 'knock' | null
+  const [knockDetectionEnabled, setKnockDetectionEnabled] = useState(true);
+  const [alarmDetectionEnabled, setAlarmDetectionEnabled] = useState(true);
 
   const isMonitoringRef = useRef(false);
   const matchCountRef = useRef(0);
@@ -29,6 +41,8 @@ export default function MonitoringScreen({ onBackToSettings }) {
   const referenceFingerprintRef = useRef(null);
   const phoneNumberRef = useRef('');
   const thresholdRef = useRef(0.85);
+  const knockEnabledRef = useRef(true);
+  const alarmEnabledRef = useRef(true);
 
   useEffect(() => {
     return () => {
@@ -41,12 +55,17 @@ export default function MonitoringScreen({ onBackToSettings }) {
     const phone = await loadPhoneNumber();
     const threshold = await loadThreshold();
 
-    if (!fingerprint) {
-      Alert.alert('إعداد ناقص', 'لازم تعمل معايرة لصوت المنبه أولًا');
+    // بصمة المنبه مطلوبة فقط لو مسار المنبه مُفعّل
+    if (alarmDetectionEnabled && !fingerprint) {
+      Alert.alert('إعداد ناقص', 'لازم تعمل معايرة لصوت المنبه أولًا، أو عطّل مسار المنبه من هذه الشاشة');
       return;
     }
     if (!phone) {
       Alert.alert('إعداد ناقص', 'لازم تدخل رقم الهاتف أولًا');
+      return;
+    }
+    if (!alarmDetectionEnabled && !knockDetectionEnabled) {
+      Alert.alert('لا يوجد مسار مفعّل', 'فعّل مسار كشف المنبه أو مسار كشف الطرق على الأقل');
       return;
     }
 
@@ -59,6 +78,8 @@ export default function MonitoringScreen({ onBackToSettings }) {
     referenceFingerprintRef.current = fingerprint;
     phoneNumberRef.current = phone;
     thresholdRef.current = threshold;
+    knockEnabledRef.current = knockDetectionEnabled;
+    alarmEnabledRef.current = alarmDetectionEnabled;
 
     await configureAudioMode();
 
@@ -85,25 +106,48 @@ export default function MonitoringScreen({ onBackToSettings }) {
         }
 
         const samples = await readWavAsSamples(uri);
-        const fingerprint = extractSpectralFingerprint(samples);
         await deleteTempFile(uri);
 
-        const similarity = cosineSimilarity(
-          fingerprint,
-          referenceFingerprintRef.current
-        );
-        setLastSimilarity(similarity);
+        let alarmMatched = false;
+        let similarity = 0;
 
-        if (similarity >= thresholdRef.current) {
+        // ── المسار 1: مطابقة بصمة المنبه الترددية ──
+        if (alarmEnabledRef.current && referenceFingerprintRef.current) {
+          const fingerprint = extractSpectralFingerprint(samples);
+          similarity = cosineSimilarity(fingerprint, referenceFingerprintRef.current);
+          setLastSimilarity(similarity);
+          alarmMatched = similarity >= thresholdRef.current;
+        }
+
+        // ── المسار 2: كشف نبضات طرق الباب المفاجئة ──
+        let knockDetected = false;
+        let knockPulseCount = 0;
+        if (knockEnabledRef.current) {
+          const { pulseCount } = detectKnockPulses(samples, SAMPLE_RATE);
+          knockPulseCount = pulseCount;
+          knockDetected = pulseCount >= KNOCK_MIN_PULSES_PER_CHUNK;
+        }
+
+        if (knockDetected) {
+          // الطرق يُكتشف فوريًا (لا يحتاج تكرار متتالي، فهو أصلاً يتطلب عدة نبضات ضمن المقطع نفسه)
+          const now = Date.now();
+          setStatus(`🚪 تم اكتشاف طرق على الباب (${knockPulseCount} نبضات) — جاري الاتصال...`);
+          if (now - lastCallTimeRef.current > COOLDOWN_MS) {
+            triggerCall('knock');
+            lastCallTimeRef.current = now;
+            setCallCount((c) => c + 1);
+          }
+          matchCountRef.current = 0;
+        } else if (alarmMatched) {
           matchCountRef.current += 1;
           setStatus(
-            `🟡 تطابق محتمل (${matchCountRef.current}/${CONSECUTIVE_MATCHES_NEEDED}) - تشابه ${(similarity * 100).toFixed(0)}%`
+            `🟡 تطابق منبه محتمل (${matchCountRef.current}/${CONSECUTIVE_MATCHES_NEEDED}) - تشابه ${(similarity * 100).toFixed(0)}%`
           );
 
           if (matchCountRef.current >= CONSECUTIVE_MATCHES_NEEDED) {
             const now = Date.now();
             if (now - lastCallTimeRef.current > COOLDOWN_MS) {
-              triggerCall();
+              triggerCall('alarm');
               lastCallTimeRef.current = now;
               setCallCount((c) => c + 1);
             }
@@ -112,9 +156,10 @@ export default function MonitoringScreen({ onBackToSettings }) {
         } else {
           matchCountRef.current = 0;
           if (isMonitoringRef.current) {
-            setStatus(
-              `🟢 المراقبة شغالة... (تشابه آخر عينة: ${(similarity * 100).toFixed(0)}%)`
-            );
+            const parts = [];
+            if (alarmEnabledRef.current) parts.push(`تشابه منبه: ${(similarity * 100).toFixed(0)}%`);
+            if (knockEnabledRef.current) parts.push(`نبضات طرق: ${knockPulseCount}`);
+            setStatus(`🟢 المراقبة شغالة... (${parts.join(' | ')})`);
           }
         }
       } catch (err) {
@@ -124,8 +169,13 @@ export default function MonitoringScreen({ onBackToSettings }) {
     }
   }
 
-  function triggerCall() {
-    setStatus('🔴 تم اكتشاف صوت التنبيه — جاري الاتصال...');
+  function triggerCall(source) {
+    setLastTrigger(source);
+    setStatus(
+      source === 'knock'
+        ? '🔴 تم اكتشاف طرق على الباب — جاري الاتصال...'
+        : '🔴 تم اكتشاف صوت المنبه — جاري الاتصال...'
+    );
     try {
       ImmediatePhoneCall.immediatePhoneCall(phoneNumberRef.current);
     } catch (err) {
@@ -137,13 +187,26 @@ export default function MonitoringScreen({ onBackToSettings }) {
     <View style={styles.container}>
       <Text style={styles.title}>📡 مراقبة الصوت</Text>
 
+      {!isMonitoring && (
+        <View style={styles.togglesBox}>
+          <View style={styles.toggleRow}>
+            <Text style={styles.toggleLabel}>🔔 كشف صوت المنبه</Text>
+            <Switch value={alarmDetectionEnabled} onValueChange={setAlarmDetectionEnabled} />
+          </View>
+          <View style={styles.toggleRow}>
+            <Text style={styles.toggleLabel}>🚪 كشف طرق الباب</Text>
+            <Switch value={knockDetectionEnabled} onValueChange={setKnockDetectionEnabled} />
+          </View>
+        </View>
+      )}
+
       <View style={styles.statusBox}>
         <Text style={styles.statusText}>{status}</Text>
       </View>
 
       <View style={styles.statsRow}>
         <View style={styles.statBox}>
-          <Text style={styles.statLabel}>آخر تشابه</Text>
+          <Text style={styles.statLabel}>آخر تشابه منبه</Text>
           <Text style={styles.statValue}>{(lastSimilarity * 100).toFixed(0)}%</Text>
         </View>
         <View style={styles.statBox}>
@@ -151,6 +214,12 @@ export default function MonitoringScreen({ onBackToSettings }) {
           <Text style={styles.statValue}>{callCount}</Text>
         </View>
       </View>
+
+      {lastTrigger && (
+        <Text style={styles.lastTriggerText}>
+          آخر سبب اتصال: {lastTrigger === 'knock' ? 'طرق على الباب 🚪' : 'صوت منبه 🔔'}
+        </Text>
+      )}
 
       {!isMonitoring ? (
         <TouchableOpacity style={styles.startButton} onPress={startMonitoring}>
@@ -186,7 +255,24 @@ const styles = StyleSheet.create({
     fontSize: 24,
     fontWeight: 'bold',
     color: '#fff',
-    marginBottom: 24,
+    marginBottom: 16,
+  },
+  togglesBox: {
+    backgroundColor: '#2a2a2a',
+    borderRadius: 12,
+    padding: 16,
+    width: '100%',
+    marginBottom: 16,
+  },
+  toggleRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 8,
+  },
+  toggleLabel: {
+    color: '#fff',
+    fontSize: 15,
   },
   statusBox: {
     backgroundColor: '#2a2a2a',
@@ -207,7 +293,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     width: '100%',
     justifyContent: 'space-between',
-    marginBottom: 24,
+    marginBottom: 12,
   },
   statBox: {
     backgroundColor: '#2a2a2a',
@@ -226,6 +312,11 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 22,
     fontWeight: 'bold',
+  },
+  lastTriggerText: {
+    color: '#facc15',
+    fontSize: 13,
+    marginBottom: 16,
   },
   startButton: {
     backgroundColor: '#16a34a',
