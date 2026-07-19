@@ -35,31 +35,68 @@ export async function readWavAsSamples(uri) {
 
 /**
  * يستخرج "البصمة الترددية" (Spectral Fingerprint) من عينات صوتية خام
- * باستخدام Fast Fourier Transform، ثم يطبّع النتيجة كي تكون
- * المقارنة مستقلة عن علو الصوت المطلق.
+ * باستخدام طريقة Welch (نوافذ متعددة متراكبة + متوسط)، بدلاً من الاكتفاء
+ * بأول نافذة FFT فقط. هذا ضروري عندما يكون طول المقطع المسجَّل أكبر من
+ * حجم نافذة FFT الواحدة (مثلاً مقطع مدته ثانيتان يحتوي نغمة صوت وفترة
+ * صمت)، لأنه يضمن تغطية المقطع بالكامل بدلاً من الاكتفاء بجزء بسيط منه
+ * فقط ثم تجاهل الباقي.
+ *
+ * الطريقة:
+ *  - نقسّم العينات إلى نوافذ متتالية بحجم FFT_SIZE مع تراكب 50%
+ *  - نطبّق نافذة Hann على كل جزء لتقليل تسرّب الطيف (spectral leakage)
+ *  - نحسب FFT لكل نافذة على حدة
+ *  - نأخذ متوسط الأطياف الناتجة عبر كل النوافذ
+ *
+ * النتيجة بصمة واحدة تمثل "متوسط" الصوت عبر المقطع بأكمله، بما يشمل
+ * فترات الصوت وفترات الصمت معًا، وهو الأنسب لنمط صوت متكرر (نغمة ثم صمت).
  */
 export function extractSpectralFingerprint(samples) {
+  const hop = Math.floor(FFT_SIZE / 2); // تراكب 50%
+  const hann = new Array(FFT_SIZE);
+  for (let i = 0; i < FFT_SIZE; i++) {
+    hann[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (FFT_SIZE - 1)));
+  }
+
   const fft = new FFT(FFT_SIZE);
-  const input = new Array(FFT_SIZE).fill(0);
+  const avgMagnitudes = new Array(FFT_SIZE / 2).fill(0);
+  let windowCount = 0;
 
-  // نستخدم أول FFT_SIZE عينة فقط من المقطع
-  for (let i = 0; i < Math.min(samples.length, FFT_SIZE); i++) {
-    input[i] = samples[i];
+  for (let start = 0; start + FFT_SIZE <= samples.length; start += hop) {
+    const windowed = new Array(FFT_SIZE);
+    for (let i = 0; i < FFT_SIZE; i++) {
+      windowed[i] = samples[start + i] * hann[i];
+    }
+
+    const output = fft.createComplexArray();
+    fft.realTransform(output, windowed);
+    fft.completeSpectrum(output);
+
+    for (let i = 0; i < FFT_SIZE / 2; i++) {
+      const real = output[i * 2];
+      const imag = output[i * 2 + 1];
+      avgMagnitudes[i] += Math.sqrt(real * real + imag * imag);
+    }
+    windowCount++;
   }
 
-  const output = fft.createComplexArray();
-  fft.realTransform(output, input);
-  fft.completeSpectrum(output);
-
-  const magnitudes = [];
-  for (let i = 0; i < FFT_SIZE; i += 2) {
-    const real = output[i];
-    const imag = output[i + 1];
-    magnitudes.push(Math.sqrt(real * real + imag * imag));
+  // احتياط: لو المقطع أقصر من نافذة FFT واحدة، نحلل ما هو متاح فقط
+  if (windowCount === 0) {
+    const input = new Array(FFT_SIZE).fill(0);
+    for (let i = 0; i < Math.min(samples.length, FFT_SIZE); i++) {
+      input[i] = samples[i];
+    }
+    const output = fft.createComplexArray();
+    fft.realTransform(output, input);
+    fft.completeSpectrum(output);
+    for (let i = 0; i < FFT_SIZE / 2; i++) {
+      const real = output[i * 2];
+      const imag = output[i * 2 + 1];
+      avgMagnitudes[i] = Math.sqrt(real * real + imag * imag);
+    }
+    windowCount = 1;
   }
 
-  // نأخذ فقط النصف الأول (الترددات الموجبة ذات المعنى الفيزيائي)
-  const halfSpectrum = magnitudes.slice(0, magnitudes.length / 2);
+  const halfSpectrum = avgMagnitudes.map((m) => m / windowCount);
 
   const maxVal = Math.max(...halfSpectrum, 1e-6);
   return halfSpectrum.map((m) => m / maxVal);
@@ -102,4 +139,62 @@ export function averageFingerprints(fingerprints) {
     }
   }
   return avg;
+}
+
+// ─── كشف نبضات الطرق (Knock Onset Detection) ─────────────────────────────
+
+/**
+ * يكشف "نبضات صوت مفاجئة وحادة" ضمن مقطع صوتي خام (مناسب لطرق الباب،
+ * على عكس FFT الذي يصلح للأصوات المستمرة الثابتة كالمنبه).
+ *
+ * الفكرة: نقسّم العينات إلى نوافذ زمنية قصيرة جدًا (مثلاً 20 مللي ثانية)،
+ * نحسب "طاقة" كل نافذة (RMS)، ثم نبحث عن قفزات حادة ومفاجئة في الطاقة
+ * (نافذة أعلى بكثير من متوسط الخلفية الحديثة) — وهذا هو "توقيع" الطرقة
+ * الميكانيكية المفاجئة، ويختلف عن الصعود التدريجي في صوت الكلام أو الموسيقى.
+ *
+ * يرجع عدد النبضات المكتشفة ضمن المقطع بأكمله.
+ */
+export function detectKnockPulses(samples, sampleRate = 16000, options = {}) {
+  const {
+    windowMs = 20, // طول كل نافذة تحليل (مللي ثانية)
+    energyRatioThreshold = 3.5, // كم ضعف يجب أن تكون الطاقة أعلى من متوسط الخلفية
+    minPulseGapMs = 100, // أقل مسافة زمنية بين نبضتين منفصلتين (لتفادي عدّ نفس الطرقة مرتين)
+    backgroundWindowCount = 8, // عدد النوافذ السابقة المستخدمة لحساب متوسط "الخلفية"
+  } = options;
+
+  const windowSize = Math.floor((windowMs / 1000) * sampleRate);
+  if (windowSize <= 0 || samples.length < windowSize) return { pulseCount: 0, pulseTimestamps: [] };
+
+  // حساب طاقة RMS لكل نافذة
+  const energies = [];
+  for (let start = 0; start + windowSize <= samples.length; start += windowSize) {
+    let sumSquares = 0;
+    for (let i = start; i < start + windowSize; i++) {
+      sumSquares += samples[i] * samples[i];
+    }
+    energies.push(Math.sqrt(sumSquares / windowSize));
+  }
+
+  const pulseTimestamps = [];
+  let lastPulseWindowIndex = -Infinity;
+  const minGapWindows = Math.ceil(minPulseGapMs / windowMs);
+
+  for (let i = backgroundWindowCount; i < energies.length; i++) {
+    // متوسط طاقة الخلفية الحديثة (بدون النافذة الحالية)
+    let backgroundSum = 0;
+    for (let j = i - backgroundWindowCount; j < i; j++) {
+      backgroundSum += energies[j];
+    }
+    const backgroundAvg = backgroundSum / backgroundWindowCount;
+
+    const isSpike =
+      energies[i] > backgroundAvg * energyRatioThreshold && energies[i] > 0.02; // حد أدنى مطلق لتفادي تضخيم ضجيج خافت جدًا
+
+    if (isSpike && i - lastPulseWindowIndex >= minGapWindows) {
+      pulseTimestamps.push((i * windowSize) / sampleRate); // بالثواني من بداية المقطع
+      lastPulseWindowIndex = i;
+    }
+  }
+
+  return { pulseCount: pulseTimestamps.length, pulseTimestamps };
 }
