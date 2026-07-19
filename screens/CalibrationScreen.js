@@ -27,6 +27,7 @@ import {
 } from '../utils/storage';
 
 const SAMPLES_NEEDED = 3; // عدد العينات المطلوبة للمعايرة الدقيقة
+const CALIBRATION_CHUNK_MS = 2500; // يغطي دورة كاملة (صوت+صمت) مع هامش أمان
 
 export default function CalibrationScreen({ onCalibrationComplete }) {
   const [isRecording, setIsRecording] = useState(false);
@@ -54,7 +55,7 @@ export default function CalibrationScreen({ onCalibrationComplete }) {
       setStatus('🔴 جاري التسجيل... شغّل صوت المنبه الآن بجانب الهاتف');
 
       await configureAudioMode();
-      const uri = await recordChunk(1500);
+      const uri = await recordChunk(CALIBRATION_CHUNK_MS);
       const samples = await readWavAsSamples(uri);
       const fingerprint = extractSpectralFingerprint(samples);
       await deleteTempFile(uri);
@@ -113,7 +114,7 @@ export default function CalibrationScreen({ onCalibrationComplete }) {
 
       <Text style={styles.label}>معايرة صوت المنبه:</Text>
       <Text style={styles.hint}>
-        سجّل {SAMPLES_NEEDED} عينات من صوت المنبه الحقيقي (كل عينة 1.5 ثانية) لضمان
+        سجّل {SAMPLES_NEEDED} عينات من صوت المنبه الحقيقي (كل عينة {(CALIBRATION_CHUNK_MS / 1000).toFixed(1)} ثانية لتغطية دورة كاملة من الصوت والصمت) لضمان
         دقة أعلى في التعرف عليه.
       </Text>
 
