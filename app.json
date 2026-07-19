@@ -1,0 +1,30 @@
+{
+  "expo": {
+    "name": "Sound Monitor",
+    "slug": "monitor-app",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "backgroundColor": "#1a1a1a"
+    },
+    "assetBundlePatterns": ["**/*"],
+    "android": {
+      "package": "com.monitorapp.soundmonitor",
+      "permissions": [
+        "RECORD_AUDIO",
+        "CALL_PHONE",
+        "WAKE_LOCK",
+        "FOREGROUND_SERVICE"
+      ]
+    },
+    "plugins": [
+      [
+        "expo-av",
+        {
+          "microphonePermission": "يحتاج هذا التطبيق الوصول للمايكروفون لمراقبة الأصوات."
+        }
+      ]
+    ]
+  }
+}
