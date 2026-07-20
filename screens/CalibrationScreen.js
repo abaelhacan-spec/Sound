@@ -8,6 +8,7 @@ import {
   ActivityIndicator,
   TextInput,
   ScrollView,
+  Switch,
 } from 'react-native';
 import {
   recordChunk,
@@ -24,6 +25,7 @@ import {
   saveReferenceFingerprint,
   savePhoneNumber,
   loadPhoneNumber,
+  saveDetectionPaths,
 } from '../utils/storage';
 
 const SAMPLES_NEEDED = 3; // عدد العينات المطلوبة للمعايرة الدقيقة
@@ -34,6 +36,8 @@ export default function CalibrationScreen({ onCalibrationComplete }) {
   const [samplesCollected, setSamplesCollected] = useState(0);
   const [collectedFingerprints, setCollectedFingerprints] = useState([]);
   const [phoneNumber, setPhoneNumber] = useState('');
+  const [alarmDetectionEnabled, setAlarmDetectionEnabled] = useState(true);
+  const [knockDetectionEnabled, setKnockDetectionEnabled] = useState(true);
   const [status, setStatus] = useState(
     'أدخل رقم الهاتف، ثم اضغط "تسجيل عينة" أثناء تشغيل صوت المنبه بجانب الهاتف'
   );
@@ -76,14 +80,31 @@ export default function CalibrationScreen({ onCalibrationComplete }) {
   }
 
   async function handleFinishCalibration() {
-    if (collectedFingerprints.length === 0) {
-      Alert.alert('تنبيه', 'لازم تسجل عينة واحدة على الأقل');
+    if (!phoneNumber || phoneNumber.trim().length < 5) {
+      Alert.alert('تنبيه', 'من فضلك أدخل رقم هاتف صحيح أولًا');
       return;
     }
 
-    const avgFingerprint = averageFingerprints(collectedFingerprints);
-    await saveReferenceFingerprint(avgFingerprint);
+    if (!alarmDetectionEnabled && !knockDetectionEnabled) {
+      Alert.alert('لا يوجد مسار مفعّل', 'فعّل مسار كشف المنبه أو مسار كشف الطرق على الأقل');
+      return;
+    }
+
+    // المعايرة مطلوبة فقط لو مسار المنبه مفعّل
+    if (alarmDetectionEnabled) {
+      if (collectedFingerprints.length === 0) {
+        Alert.alert('تنبيه', 'لازم تسجل عينة واحدة على الأقل، أو عطّل مسار كشف المنبه أعلاه');
+        return;
+      }
+      const avgFingerprint = averageFingerprints(collectedFingerprints);
+      await saveReferenceFingerprint(avgFingerprint);
+    }
+
     await savePhoneNumber(phoneNumber.trim());
+    await saveDetectionPaths({
+      alarmEnabled: alarmDetectionEnabled,
+      knockEnabled: knockDetectionEnabled,
+    });
 
     Alert.alert('تم الحفظ', 'تم حفظ إعدادات المراقبة بنجاح', [
       { text: 'حسنًا', onPress: () => onCalibrationComplete() },
@@ -112,44 +133,62 @@ export default function CalibrationScreen({ onCalibrationComplete }) {
 
       <View style={styles.divider} />
 
-      <Text style={styles.label}>معايرة صوت المنبه:</Text>
-      <Text style={styles.hint}>
-        سجّل {SAMPLES_NEEDED} عينات من صوت المنبه الحقيقي (كل عينة {(CALIBRATION_CHUNK_MS / 1000).toFixed(1)} ثانية لتغطية دورة كاملة من الصوت والصمت) لضمان
-        دقة أعلى في التعرف عليه.
-      </Text>
+      <Text style={styles.label}>مسارات الكشف المطلوبة:</Text>
+      <View style={styles.togglesBox}>
+        <View style={styles.toggleRow}>
+          <Text style={styles.toggleLabel}>🔔 كشف صوت المنبه (يحتاج معايرة)</Text>
+          <Switch value={alarmDetectionEnabled} onValueChange={setAlarmDetectionEnabled} />
+        </View>
+        <View style={styles.toggleRow}>
+          <Text style={styles.toggleLabel}>🚪 كشف طرق الباب (بدون معايرة)</Text>
+          <Switch value={knockDetectionEnabled} onValueChange={setKnockDetectionEnabled} />
+        </View>
+      </View>
 
-      <Text style={styles.progress}>
-        العينات المسجّلة: {samplesCollected} / {SAMPLES_NEEDED}
-      </Text>
+      {alarmDetectionEnabled && (
+        <>
+          <View style={styles.divider} />
 
-      <TouchableOpacity
-        style={[styles.button, isRecording && styles.buttonDisabled]}
-        onPress={handleRecordSample}
-        disabled={isRecording}
-      >
-        {isRecording ? (
-          <ActivityIndicator color="#fff" />
-        ) : (
-          <Text style={styles.buttonText}>🎙️ تسجيل عينة</Text>
-        )}
-      </TouchableOpacity>
+          <Text style={styles.label}>معايرة صوت المنبه:</Text>
+          <Text style={styles.hint}>
+            سجّل {SAMPLES_NEEDED} عينات من صوت المنبه الحقيقي (كل عينة {(CALIBRATION_CHUNK_MS / 1000).toFixed(1)} ثانية لتغطية دورة كاملة من الصوت والصمت) لضمان
+            دقة أعلى في التعرف عليه.
+          </Text>
+
+          <Text style={styles.progress}>
+            العينات المسجّلة: {samplesCollected} / {SAMPLES_NEEDED}
+          </Text>
+
+          <TouchableOpacity
+            style={[styles.button, isRecording && styles.buttonDisabled]}
+            onPress={handleRecordSample}
+            disabled={isRecording}
+          >
+            {isRecording ? (
+              <ActivityIndicator color="#fff" />
+            ) : (
+              <Text style={styles.buttonText}>🎙️ تسجيل عينة</Text>
+            )}
+          </TouchableOpacity>
+
+          {samplesCollected > 0 && (
+            <TouchableOpacity style={styles.secondaryButton} onPress={handleReset}>
+              <Text style={styles.secondaryButtonText}>إعادة تعيين العينات</Text>
+            </TouchableOpacity>
+          )}
+        </>
+      )}
 
       <Text style={styles.status}>{status}</Text>
-
-      {samplesCollected > 0 && (
-        <TouchableOpacity style={styles.secondaryButton} onPress={handleReset}>
-          <Text style={styles.secondaryButtonText}>إعادة تعيين العينات</Text>
-        </TouchableOpacity>
-      )}
 
       <TouchableOpacity
         style={[
           styles.button,
           styles.finishButton,
-          collectedFingerprints.length === 0 && styles.buttonDisabled,
+          alarmDetectionEnabled && collectedFingerprints.length === 0 && styles.buttonDisabled,
         ]}
         onPress={handleFinishCalibration}
-        disabled={collectedFingerprints.length === 0}
+        disabled={alarmDetectionEnabled && collectedFingerprints.length === 0}
       >
         <Text style={styles.buttonText}>✅ حفظ وإنهاء الإعداد</Text>
       </TouchableOpacity>
@@ -196,6 +235,24 @@ const styles = StyleSheet.create({
     height: 1,
     backgroundColor: '#333',
     marginVertical: 20,
+  },
+  togglesBox: {
+    backgroundColor: '#2a2a2a',
+    borderRadius: 12,
+    padding: 16,
+    marginBottom: 8,
+  },
+  toggleRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 8,
+  },
+  toggleLabel: {
+    color: '#fff',
+    fontSize: 14,
+    flex: 1,
+    marginRight: 8,
   },
   progress: {
     color: '#4CAF50',

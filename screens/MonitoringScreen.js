@@ -14,7 +14,13 @@ import {
   cosineSimilarity,
   detectKnockPulses,
 } from '../utils/audioFingerprint';
-import { loadReferenceFingerprint, loadPhoneNumber, loadThreshold } from '../utils/storage';
+import {
+  loadReferenceFingerprint,
+  loadPhoneNumber,
+  loadThreshold,
+  loadDetectionPaths,
+  saveDetectionPaths,
+} from '../utils/storage';
 
 const CONSECUTIVE_MATCHES_NEEDED = 3; // عدد المقاطع المتتالية المطلوب تطابقها (مسار المنبه)
 const COOLDOWN_MS = 30000; // مهلة قبل السماح باتصال جديد بعد الاتصال السابق
@@ -45,6 +51,11 @@ export default function MonitoringScreen({ onBackToSettings }) {
   const alarmEnabledRef = useRef(true);
 
   useEffect(() => {
+    loadDetectionPaths().then(({ alarmEnabled, knockEnabled }) => {
+      setAlarmDetectionEnabled(alarmEnabled);
+      setKnockDetectionEnabled(knockEnabled);
+    });
+
     return () => {
       isMonitoringRef.current = false;
     };
@@ -80,6 +91,11 @@ export default function MonitoringScreen({ onBackToSettings }) {
     thresholdRef.current = threshold;
     knockEnabledRef.current = knockDetectionEnabled;
     alarmEnabledRef.current = alarmDetectionEnabled;
+
+    await saveDetectionPaths({
+      alarmEnabled: alarmDetectionEnabled,
+      knockEnabled: knockDetectionEnabled,
+    });
 
     await configureAudioMode();
 
