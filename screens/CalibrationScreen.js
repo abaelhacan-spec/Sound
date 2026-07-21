@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import {
   View,
   Text,
@@ -10,6 +10,7 @@ import {
   ScrollView,
   Switch,
 } from 'react-native';
+import { Audio } from 'expo-av';
 import {
   recordChunk,
   deleteTempFile,
@@ -20,6 +21,7 @@ import {
   readWavAsSamples,
   extractSpectralFingerprint,
   averageFingerprints,
+  computeRMS,
 } from '../utils/audioFingerprint';
 import {
   saveReferenceFingerprint,
@@ -30,6 +32,7 @@ import {
 
 const SAMPLES_NEEDED = 3; // عدد العينات المطلوبة للمعايرة الدقيقة
 const CALIBRATION_CHUNK_MS = 2500; // يغطي دورة كاملة (صوت+صمت) مع هامش أمان
+const MIN_GOOD_ENERGY_RMS = 0.015; // نفس حد الطاقة الدنيا المستخدم أثناء المراقبة، لتنبيه المستخدم مبكرًا لو العينة خافتة جدًا
 
 export default function CalibrationScreen({ onCalibrationComplete }) {
   const [isRecording, setIsRecording] = useState(false);
@@ -38,9 +41,25 @@ export default function CalibrationScreen({ onCalibrationComplete }) {
   const [phoneNumber, setPhoneNumber] = useState('');
   const [alarmDetectionEnabled, setAlarmDetectionEnabled] = useState(true);
   const [knockDetectionEnabled, setKnockDetectionEnabled] = useState(true);
+  const [pendingSample, setPendingSample] = useState(null); // { uri, fingerprint, energy } بانتظار مراجعة المستخدم
+  const [isPlaying, setIsPlaying] = useState(false);
+  const soundRef = useRef(null);
   const [status, setStatus] = useState(
     'أدخل رقم الهاتف، ثم اضغط "تسجيل عينة" أثناء تشغيل صوت المنبه بجانب الهاتف'
   );
+
+  // تنظيف الصوت والملف المؤقت لو المستخدم غادر الشاشة وفيه عينة لسه معلّقة
+  useEffect(() => {
+    return () => {
+      if (soundRef.current) {
+        soundRef.current.unloadAsync().catch(() => {});
+      }
+      if (pendingSample?.uri) {
+        deleteTempFile(pendingSample.uri);
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   async function handleRecordSample() {
     if (!phoneNumber || phoneNumber.trim().length < 5) {
@@ -62,16 +81,11 @@ export default function CalibrationScreen({ onCalibrationComplete }) {
       const uri = await recordChunk(CALIBRATION_CHUNK_MS);
       const samples = await readWavAsSamples(uri);
       const fingerprint = extractSpectralFingerprint(samples);
-      await deleteTempFile(uri);
+      const energy = computeRMS(samples);
 
-      const updated = [...collectedFingerprints, fingerprint];
-      setCollectedFingerprints(updated);
-      setSamplesCollected(updated.length);
-      setStatus(
-        updated.length < SAMPLES_NEEDED
-          ? `تم تسجيل ${updated.length} من ${SAMPLES_NEEDED} عينات. سجّل عينة أخرى.`
-          : 'تم جمع كل العينات! اضغط "حفظ وإنهاء الإعداد".'
-      );
+      // لا نحذف الملف ولا نضيف العينة مباشرة — ننتظر مراجعة المستخدم أولًا
+      setPendingSample({ uri, fingerprint, energy });
+      setStatus('🎧 استمع للعينة تأكد من جودتها، ثم اعتمدها أو أعد التسجيل');
     } catch (err) {
       Alert.alert('خطأ', 'حدث خطأ أثناء التسجيل: ' + err.message);
     } finally {
@@ -79,9 +93,69 @@ export default function CalibrationScreen({ onCalibrationComplete }) {
     }
   }
 
+  async function handlePlayPending() {
+    if (!pendingSample) return;
+    try {
+      if (soundRef.current) {
+        await soundRef.current.unloadAsync();
+        soundRef.current = null;
+      }
+      const { sound } = await Audio.Sound.createAsync({ uri: pendingSample.uri });
+      soundRef.current = sound;
+      setIsPlaying(true);
+      sound.setOnPlaybackStatusUpdate((s) => {
+        if (s.didJustFinish) {
+          setIsPlaying(false);
+        }
+      });
+      await sound.playAsync();
+    } catch (err) {
+      setIsPlaying(false);
+      Alert.alert('خطأ', 'تعذر تشغيل العينة: ' + err.message);
+    }
+  }
+
+  async function cleanupPendingSound() {
+    if (soundRef.current) {
+      await soundRef.current.unloadAsync().catch(() => {});
+      soundRef.current = null;
+    }
+    setIsPlaying(false);
+  }
+
+  async function handleAcceptPending() {
+    if (!pendingSample) return;
+    const updated = [...collectedFingerprints, pendingSample.fingerprint];
+    setCollectedFingerprints(updated);
+    setSamplesCollected(updated.length);
+
+    await cleanupPendingSound();
+    await deleteTempFile(pendingSample.uri);
+    setPendingSample(null);
+
+    setStatus(
+      updated.length < SAMPLES_NEEDED
+        ? `تم اعتماد ${updated.length} من ${SAMPLES_NEEDED} عينات. سجّل عينة أخرى.`
+        : 'تم جمع كل العينات! اضغط "حفظ وإنهاء الإعداد".'
+    );
+  }
+
+  async function handleRejectPending() {
+    if (!pendingSample) return;
+    await cleanupPendingSound();
+    await deleteTempFile(pendingSample.uri);
+    setPendingSample(null);
+    setStatus('تم تجاهل العينة. اضغط "تسجيل عينة" لإعادة المحاولة.');
+  }
+
   async function handleFinishCalibration() {
     if (!phoneNumber || phoneNumber.trim().length < 5) {
       Alert.alert('تنبيه', 'من فضلك أدخل رقم هاتف صحيح أولًا');
+      return;
+    }
+
+    if (pendingSample) {
+      Alert.alert('عينة بانتظار المراجعة', 'اعتمد العينة المسجّلة أو ألغِها أولًا قبل إنهاء الإعداد');
       return;
     }
 
@@ -111,7 +185,12 @@ export default function CalibrationScreen({ onCalibrationComplete }) {
     ]);
   }
 
-  function handleReset() {
+  async function handleReset() {
+    if (pendingSample) {
+      await cleanupPendingSound();
+      await deleteTempFile(pendingSample.uri);
+      setPendingSample(null);
+    }
     setCollectedFingerprints([]);
     setSamplesCollected(0);
     setStatus('تم المسح. سجّل العينات من جديد.');
@@ -160,9 +239,9 @@ export default function CalibrationScreen({ onCalibrationComplete }) {
           </Text>
 
           <TouchableOpacity
-            style={[styles.button, isRecording && styles.buttonDisabled]}
+            style={[styles.button, (isRecording || pendingSample) && styles.buttonDisabled]}
             onPress={handleRecordSample}
-            disabled={isRecording}
+            disabled={isRecording || !!pendingSample}
           >
             {isRecording ? (
               <ActivityIndicator color="#fff" />
@@ -170,6 +249,37 @@ export default function CalibrationScreen({ onCalibrationComplete }) {
               <Text style={styles.buttonText}>🎙️ تسجيل عينة</Text>
             )}
           </TouchableOpacity>
+
+          {pendingSample && (
+            <View style={styles.reviewBox}>
+              <Text style={styles.reviewTitle}>🎧 مراجعة العينة قبل الاعتماد</Text>
+              <Text
+                style={[
+                  styles.reviewQuality,
+                  pendingSample.energy < MIN_GOOD_ENERGY_RMS
+                    ? styles.reviewQualityWeak
+                    : styles.reviewQualityGood,
+                ]}
+              >
+                {pendingSample.energy < MIN_GOOD_ENERGY_RMS
+                  ? '⚠️ الصوت خافت — قرّب الهاتف من مصدر الصوت أو ارفع مستواه، وأعد التسجيل'
+                  : '✅ مستوى الصوت جيد'}
+              </Text>
+
+              <TouchableOpacity style={styles.playButton} onPress={handlePlayPending}>
+                <Text style={styles.buttonText}>{isPlaying ? '⏸️ جاري التشغيل...' : '▶️ استماع للعينة'}</Text>
+              </TouchableOpacity>
+
+              <View style={styles.reviewActionsRow}>
+                <TouchableOpacity style={styles.rejectButton} onPress={handleRejectPending}>
+                  <Text style={styles.buttonText}>🔁 إعادة التسجيل</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.acceptButton} onPress={handleAcceptPending}>
+                  <Text style={styles.buttonText}>✅ اعتماد العينة</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          )}
 
           {samplesCollected > 0 && (
             <TouchableOpacity style={styles.secondaryButton} onPress={handleReset}>
@@ -259,6 +369,60 @@ const styles = StyleSheet.create({
     fontSize: 15,
     marginBottom: 16,
     textAlign: 'center',
+  },
+  reviewBox: {
+    backgroundColor: '#232b3d',
+    borderRadius: 12,
+    padding: 16,
+    marginBottom: 16,
+    borderWidth: 1,
+    borderColor: '#2563eb',
+  },
+  reviewTitle: {
+    color: '#fff',
+    fontSize: 15,
+    fontWeight: '600',
+    marginBottom: 8,
+    textAlign: 'center',
+  },
+  reviewQuality: {
+    fontSize: 13,
+    textAlign: 'center',
+    marginBottom: 12,
+    lineHeight: 19,
+  },
+  reviewQualityGood: {
+    color: '#4ade80',
+  },
+  reviewQualityWeak: {
+    color: '#facc15',
+  },
+  playButton: {
+    backgroundColor: '#334155',
+    padding: 14,
+    borderRadius: 10,
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  reviewActionsRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+  rejectButton: {
+    backgroundColor: '#dc2626',
+    padding: 14,
+    borderRadius: 10,
+    alignItems: 'center',
+    flex: 1,
+    marginRight: 8,
+  },
+  acceptButton: {
+    backgroundColor: '#16a34a',
+    padding: 14,
+    borderRadius: 10,
+    alignItems: 'center',
+    flex: 1,
+    marginLeft: 8,
   },
   button: {
     backgroundColor: '#2563eb',
