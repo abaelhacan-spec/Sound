@@ -3,7 +3,7 @@ import { StatusBar } from 'expo-status-bar';
 import { View, ActivityIndicator, StyleSheet } from 'react-native';
 import CalibrationScreen from './screens/CalibrationScreen';
 import MonitoringScreen from './screens/MonitoringScreen';
-import { loadReferenceFingerprint, loadPhoneNumber, loadDetectionPaths } from './utils/storage';
+import { loadAlarmReferenceSamples, loadPhoneNumber, loadDetectionPaths } from './utils/storage';
 
 export default function App() {
   const [isLoading, setIsLoading] = useState(true);
@@ -14,12 +14,12 @@ export default function App() {
   }, []);
 
   async function checkExistingSetup() {
-    const fingerprint = await loadReferenceFingerprint();
+    const referenceSamples = await loadAlarmReferenceSamples();
     const phone = await loadPhoneNumber();
     const { alarmEnabled } = await loadDetectionPaths();
 
-    // الإعداد مكتمل لو فيه رقم هاتف، وبصمة منبه محفوظة (لو مسار المنبه مفعّل فقط)
-    const setupComplete = phone && (!alarmEnabled || fingerprint);
+    // الإعداد مكتمل لو فيه رقم هاتف، وعينات مرجعية للمنبه محفوظة (لو مسار المنبه مفعّل فقط)
+    const setupComplete = phone && (!alarmEnabled || (referenceSamples && referenceSamples.length > 0));
 
     if (setupComplete) {
       setCurrentScreen('monitoring');
