@@ -103,6 +103,22 @@ export function extractSpectralFingerprint(samples) {
 }
 
 /**
+ * يحسب طاقة RMS الكلية لمقطع صوتي خام كامل (وليس نافذة واحدة فقط).
+ * تُستخدم كـ"بوابة طاقة" (Energy Gate) قبل مطابقة بصمة المنبه: لأن البصمة
+ * الترددية تُطبَّع دائمًا (قيمتها القصوى = 1) بغض النظر عن حجم الصوت،
+ * فالصمت التام أو الضوضاء الخافتة جدًا قد يُطبَّع رياضيًا بشكل يشبه أي
+ * بصمة مرجعية، ما يسبب تطابقات وهمية. حساب الطاقة الفعلية أولًا يمنع هذا.
+ */
+export function computeRMS(samples) {
+  if (!samples || samples.length === 0) return 0;
+  let sumSquares = 0;
+  for (let i = 0; i < samples.length; i++) {
+    sumSquares += samples[i] * samples[i];
+  }
+  return Math.sqrt(sumSquares / samples.length);
+}
+
+/**
  * يحسب درجة التشابه (Cosine Similarity) بين بصمتين ترددتين.
  * القيمة بين 0 (مختلف تمامًا) و 1 (متطابق تمامًا).
  */
