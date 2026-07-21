@@ -30,7 +30,8 @@
         {
           "microphonePermission": "يحتاج هذا التطبيق الوصول للمايكروفون لمراقبة الأصوات."
         }
-      ]
+      ],
+      "react-native-fast-tflite"
     ],
     "extra": {
       "eas": {

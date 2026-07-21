@@ -3,7 +3,12 @@ import { StatusBar } from 'expo-status-bar';
 import { View, ActivityIndicator, StyleSheet } from 'react-native';
 import CalibrationScreen from './screens/CalibrationScreen';
 import MonitoringScreen from './screens/MonitoringScreen';
-import { loadAlarmReferenceSamples, loadPhoneNumber, loadDetectionPaths } from './utils/storage';
+import {
+  loadAlarmReferenceEmbeddings,
+  loadKnockReferenceEmbeddings,
+  loadPhoneNumber,
+  loadDetectionPaths,
+} from './utils/storage';
 
 export default function App() {
   const [isLoading, setIsLoading] = useState(true);
@@ -14,12 +19,15 @@ export default function App() {
   }, []);
 
   async function checkExistingSetup() {
-    const referenceSamples = await loadAlarmReferenceSamples();
+    const alarmEmbeddings = await loadAlarmReferenceEmbeddings();
+    const knockEmbeddings = await loadKnockReferenceEmbeddings();
     const phone = await loadPhoneNumber();
-    const { alarmEnabled } = await loadDetectionPaths();
+    const { alarmEnabled, knockEnabled } = await loadDetectionPaths();
 
-    // الإعداد مكتمل لو فيه رقم هاتف، وعينات مرجعية للمنبه محفوظة (لو مسار المنبه مفعّل فقط)
-    const setupComplete = phone && (!alarmEnabled || (referenceSamples && referenceSamples.length > 0));
+    // الإعداد مكتمل لو فيه رقم هاتف، وكل مسار مفعّل لديه عينات مرجعية محفوظة بالفعل
+    const alarmReady = !alarmEnabled || (alarmEmbeddings && alarmEmbeddings.length > 0);
+    const knockReady = !knockEnabled || (knockEmbeddings && knockEmbeddings.length > 0);
+    const setupComplete = phone && alarmReady && knockReady;
 
     if (setupComplete) {
       setCurrentScreen('monitoring');
