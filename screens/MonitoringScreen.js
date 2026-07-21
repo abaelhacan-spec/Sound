@@ -13,6 +13,7 @@ import {
   extractSpectralFingerprint,
   cosineSimilarity,
   detectKnockPulses,
+  computeRMS,
 } from '../utils/audioFingerprint';
 import {
   loadReferenceFingerprint,
@@ -29,6 +30,12 @@ const SAMPLE_RATE = 16000; // يجب أن يطابق sampleRate في audioRecord
 
 // إعدادات مسار كشف الطرق (لا يحتاج معايرة، يكشف أي نبضة صوت حادة ومفاجئة)
 const KNOCK_MIN_PULSES_PER_CHUNK = 2; // أقل عدد نبضات خلال المقطع الواحد لاعتباره "طرق باب" فعلي
+
+// بوابة الطاقة الدنيا لمسار المنبه: أي مقطع أهدأ من هذا الحد يُعتبر "صمت"
+// ولا يُقارَن بالبصمة إطلاقًا، لمنع تطابقات وهمية مع ضوضاء خافتة أو صمت المايك.
+// لو لاحظت أن الاتصالات الوهمية مستمرة رغم هذا، ارفع القيمة قليلاً (مثلاً 0.02).
+// لو لاحظت أن المنبه الحقيقي لا يُكتشف، اخفضها قليلاً (مثلاً 0.008).
+const MIN_ALARM_ENERGY_RMS = 0.015;
 
 export default function MonitoringScreen({ onBackToSettings }) {
   useKeepAwake();
@@ -49,6 +56,7 @@ export default function MonitoringScreen({ onBackToSettings }) {
   const thresholdRef = useRef(0.85);
   const knockEnabledRef = useRef(true);
   const alarmEnabledRef = useRef(true);
+  const previousKnockPulseCountRef = useRef(0); // لتتبّع النبضات المقسومة على حدود مقطعين متتاليين
 
   useEffect(() => {
     loadDetectionPaths().then(({ alarmEnabled, knockEnabled }) => {
@@ -127,21 +135,33 @@ export default function MonitoringScreen({ onBackToSettings }) {
         let alarmMatched = false;
         let similarity = 0;
 
-        // ── المسار 1: مطابقة بصمة المنبه الترددية ──
+        // ── المسار 1: مطابقة بصمة المنبه الترددية (مع بوابة طاقة دنيا) ──
         if (alarmEnabledRef.current && referenceFingerprintRef.current) {
-          const fingerprint = extractSpectralFingerprint(samples);
-          similarity = cosineSimilarity(fingerprint, referenceFingerprintRef.current);
-          setLastSimilarity(similarity);
-          alarmMatched = similarity >= thresholdRef.current;
+          const overallEnergy = computeRMS(samples);
+          if (overallEnergy >= MIN_ALARM_ENERGY_RMS) {
+            const fingerprint = extractSpectralFingerprint(samples);
+            similarity = cosineSimilarity(fingerprint, referenceFingerprintRef.current);
+            setLastSimilarity(similarity);
+            alarmMatched = similarity >= thresholdRef.current;
+          } else {
+            // المقطع هادئ جدًا (صمت تقريبًا) — لا تتم مقارنته بالبصمة إطلاقًا
+            setLastSimilarity(0);
+          }
         }
 
-        // ── المسار 2: كشف نبضات طرق الباب المفاجئة ──
+        // ── المسار 2: كشف نبضات طرق الباب المفاجئة (مع تراكب بين المقاطع) ──
         let knockDetected = false;
         let knockPulseCount = 0;
         if (knockEnabledRef.current) {
           const { pulseCount } = detectKnockPulses(samples, SAMPLE_RATE);
           knockPulseCount = pulseCount;
-          knockDetected = pulseCount >= KNOCK_MIN_PULSES_PER_CHUNK;
+          // النبضتان المطلوبتان قد تُقسمان بين نهاية مقطع وبداية التالي بسبب
+          // فجوة التسجيل القصيرة بينهما؛ لذلك نعتبر الطرق مكتشفًا أيضًا لو
+          // وُجدت نبضة واحدة في هذا المقطع ونبضة واحدة على الأقل في المقطع
+          // السابق مباشرة.
+          knockDetected =
+            pulseCount >= KNOCK_MIN_PULSES_PER_CHUNK ||
+            (pulseCount >= 1 && previousKnockPulseCountRef.current >= 1);
         }
 
         if (knockDetected) {
@@ -154,6 +174,7 @@ export default function MonitoringScreen({ onBackToSettings }) {
             setCallCount((c) => c + 1);
           }
           matchCountRef.current = 0;
+          previousKnockPulseCountRef.current = 0; // تصفير لمنع تفعيل مزدوج من بقايا نفس الطرقة
         } else if (alarmMatched) {
           matchCountRef.current += 1;
           setStatus(
@@ -169,8 +190,10 @@ export default function MonitoringScreen({ onBackToSettings }) {
             }
             matchCountRef.current = 0;
           }
+          previousKnockPulseCountRef.current = knockPulseCount;
         } else {
           matchCountRef.current = 0;
+          previousKnockPulseCountRef.current = knockPulseCount;
           if (isMonitoringRef.current) {
             const parts = [];
             if (alarmEnabledRef.current) parts.push(`تشابه منبه: ${(similarity * 100).toFixed(0)}%`);
