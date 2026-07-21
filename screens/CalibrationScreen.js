@@ -17,55 +17,48 @@ import {
   requestAudioPermission,
   configureAudioMode,
 } from '../utils/audioRecorder';
+import { readWavAsSamples, computeRMS } from '../utils/audioFingerprint';
+import { loadEmbeddingModel, extractEmbedding } from '../utils/embeddingModel';
 import {
-  readWavAsSamples,
-  extractSpectralFingerprint,
-  computeRMS,
-  extractDominantFrequency,
-  extractBandEnergyDistribution,
-  computeEnvelope,
-  extractRhythmPattern,
-  detectKnockPulses,
-  extractKnockPulseShape,
-  averageKnockShapes,
-} from '../utils/audioFingerprint';
-import {
-  saveAlarmReferenceSamples,
+  saveAlarmReferenceEmbeddings,
+  saveKnockReferenceEmbeddings,
   savePhoneNumber,
   loadPhoneNumber,
   saveDetectionPaths,
-  saveKnockCalibration,
 } from '../utils/storage';
 
-const SAMPLES_NEEDED = 3; // عدد عينات معايرة المنبه المطلوبة
-const KNOCK_SAMPLES_NEEDED = 5; // عدد عينات معايرة طرق الباب الاختيارية
-const CALIBRATION_CHUNK_MS = 2500; // يغطي دورة كاملة (صوت+صمت) مع هامش أمان لصوت المنبه
-const KNOCK_CALIBRATION_CHUNK_MS = 1500; // كافية لالتقاط طرقة واحدة واضحة
-const SAMPLE_RATE = 16000;
+// عدد العينات الأدنى المطلوب لكل صوت. كل عينة تُحوَّل إلى Embedding واحد
+// (1024 رقم) عبر YAMNet ثم تُخزَّن كما هي — لا حاجة لأي استخراج ميزات يدوي
+// بعد الآن. زيادة هذا الرقم (مثلاً إلى 15-20) يُحسِّن الدقة تجريبيًا لأنه
+// يمنح "سحابة" أوسع من نقاط المقارنة عند المطابقة (Max Similarity).
+const SAMPLES_NEEDED = 5;
+const KNOCK_SAMPLES_NEEDED = 5;
+const CHUNK_MS = 2000; // كافية لتغطية نغمة المنبه أو الطرقة بالكامل، وأطول من حد YAMNet الأدنى (0.975s)
 const MIN_GOOD_ENERGY_RMS = 0.015; // نفس حد الطاقة الدنيا المستخدم أثناء المراقبة، لتنبيه المستخدم مبكرًا لو العينة خافتة جدًا
 
 export default function CalibrationScreen({ onCalibrationComplete }) {
-  const [isRecording, setIsRecording] = useState(false);
-  const [samplesCollected, setSamplesCollected] = useState(0);
-  const [collectedAlarmSamples, setCollectedAlarmSamples] = useState([]); // كل عنصر: {fingerprint, dominantFreq, envelope, rhythm, bandEnergy, rms}
   const [phoneNumber, setPhoneNumber] = useState('');
   const [alarmDetectionEnabled, setAlarmDetectionEnabled] = useState(true);
   const [knockDetectionEnabled, setKnockDetectionEnabled] = useState(true);
-  const [pendingSample, setPendingSample] = useState(null); // عينة منبه بانتظار المراجعة: { uri, features }
   const [isPlaying, setIsPlaying] = useState(false);
+  const [isModelLoading, setIsModelLoading] = useState(false);
   const soundRef = useRef(null);
+  const modelRef = useRef(null);
 
-  // ── حالة معايرة طرق الباب الاختيارية ──
-  const [knockCalibrationEnabled, setKnockCalibrationEnabled] = useState(false);
+  // ── حالة معايرة المنبه ──
+  const [isRecording, setIsRecording] = useState(false);
+  const [collectedAlarmEmbeddings, setCollectedAlarmEmbeddings] = useState([]);
+  const [pendingSample, setPendingSample] = useState(null); // { uri, embedding, rms }
+
+  // ── حالة معايرة طرق الباب ──
   const [isRecordingKnock, setIsRecordingKnock] = useState(false);
-  const [knockShapesCollected, setKnockShapesCollected] = useState([]); // شكل نبضة لكل عينة مقبولة
-  const [pendingKnockSample, setPendingKnockSample] = useState(null); // { uri, shape, pulseCount }
+  const [collectedKnockEmbeddings, setCollectedKnockEmbeddings] = useState([]);
+  const [pendingKnockSample, setPendingKnockSample] = useState(null); // { uri, embedding, rms }
 
   const [status, setStatus] = useState(
     'أدخل رقم الهاتف، ثم اضغط "تسجيل عينة" أثناء تشغيل صوت المنبه بجانب الهاتف'
   );
 
-  // تنظيف الصوت والملفات المؤقتة لو المستخدم غادر الشاشة وفيه عينات لسه معلّقة
   useEffect(() => {
     return () => {
       if (soundRef.current) {
@@ -82,6 +75,19 @@ export default function CalibrationScreen({ onCalibrationComplete }) {
       if (saved) setPhoneNumber(saved);
     });
   }, []);
+
+  /** يحمّل نموذج YAMNet مرة واحدة عند أول استخدام فعلي، وليس عند فتح الشاشة مباشرة */
+  async function getModel() {
+    if (!modelRef.current) {
+      setIsModelLoading(true);
+      try {
+        modelRef.current = await loadEmbeddingModel();
+      } finally {
+        setIsModelLoading(false);
+      }
+    }
+    return modelRef.current;
+  }
 
   // ═══════════════════════════════════════════════════════════════════
   // ═══ معايرة صوت المنبه ═══════════════════════════════════════════════
@@ -103,22 +109,16 @@ export default function CalibrationScreen({ onCalibrationComplete }) {
       setIsRecording(true);
       setStatus('🔴 جاري التسجيل... شغّل صوت المنبه الآن بجانب الهاتف');
 
+      const model = await getModel();
       await configureAudioMode();
-      const uri = await recordChunk(CALIBRATION_CHUNK_MS);
+      const uri = await recordChunk(CHUNK_MS);
       const samples = await readWavAsSamples(uri);
-
-      // ── استخراج كل الخصائص المطلوبة للنظام الجديد دفعة واحدة ──
-      const fingerprint = extractSpectralFingerprint(samples);
-      const dominantFreq = extractDominantFrequency(fingerprint, SAMPLE_RATE);
-      const bandEnergy = extractBandEnergyDistribution(fingerprint);
-      const envelope = computeEnvelope(samples, SAMPLE_RATE);
-      const rhythm = extractRhythmPattern(envelope); // نمط الإيقاع يُستخرج تلقائيًا من نفس المقطع، بدون خطوة إضافية من المستخدم
       const rms = computeRMS(samples);
 
-      const features = { fingerprint, dominantFreq, bandEnergy, envelope, rhythm, rms };
+      setStatus('🧠 جاري استخراج البصمة الصوتية...');
+      const embedding = await extractEmbedding(samples, model);
 
-      // لا نحذف الملف ولا نضيف العينة مباشرة — ننتظر مراجعة المستخدم أولًا
-      setPendingSample({ uri, features });
+      setPendingSample({ uri, embedding, rms });
       setStatus('🎧 استمع للعينة وتأكد من جودتها، ثم اعتمدها أو أعد التسجيل');
     } catch (err) {
       Alert.alert('خطأ', 'حدث خطأ أثناء التسجيل: ' + err.message);
@@ -157,9 +157,8 @@ export default function CalibrationScreen({ onCalibrationComplete }) {
 
   async function handleAcceptPending() {
     if (!pendingSample) return;
-    const updated = [...collectedAlarmSamples, pendingSample.features];
-    setCollectedAlarmSamples(updated);
-    setSamplesCollected(updated.length);
+    const updated = [...collectedAlarmEmbeddings, pendingSample.embedding];
+    setCollectedAlarmEmbeddings(updated);
 
     await cleanupPlayingSound();
     await deleteTempFile(pendingSample.uri);
@@ -186,13 +185,12 @@ export default function CalibrationScreen({ onCalibrationComplete }) {
       await deleteTempFile(pendingSample.uri);
       setPendingSample(null);
     }
-    setCollectedAlarmSamples([]);
-    setSamplesCollected(0);
+    setCollectedAlarmEmbeddings([]);
     setStatus('تم مسح عينات المنبه. سجّلها من جديد.');
   }
 
   // ═══════════════════════════════════════════════════════════════════
-  // ═══ معايرة طرق الباب (اختيارية) ═════════════════════════════════════
+  // ═══ معايرة طرق الباب ════════════════════════════════════════════════
   // ═══════════════════════════════════════════════════════════════════
 
   async function handleRecordKnockSample() {
@@ -206,38 +204,16 @@ export default function CalibrationScreen({ onCalibrationComplete }) {
       setIsRecordingKnock(true);
       setStatus('🔴 جاري التسجيل... اطرق الباب مرة واحدة بقوة اعتيادية الآن');
 
+      const model = await getModel();
       await configureAudioMode();
-      const uri = await recordChunk(KNOCK_CALIBRATION_CHUNK_MS);
+      const uri = await recordChunk(CHUNK_MS);
       const samples = await readWavAsSamples(uri);
+      const rms = computeRMS(samples);
 
-      const { pulseCount, pulseTimestamps } = detectKnockPulses(samples, SAMPLE_RATE);
+      setStatus('🧠 جاري استخراج البصمة الصوتية...');
+      const embedding = await extractEmbedding(samples, model);
 
-      if (pulseCount === 0) {
-        setPendingKnockSample({ uri, shape: null, pulseCount: 0 });
-        setStatus('⚠️ لم يُكتشف طرق واضح في هذه العينة');
-        return;
-      }
-
-      // لو حصلت أكثر من نبضة (طرقتين بالغلط)، نختار الأقوى (الأعلى طاقة) كممثّل للعينة
-      let strongestTimeSec = pulseTimestamps[0];
-      if (pulseTimestamps.length > 1) {
-        let bestEnergy = -1;
-        for (const t of pulseTimestamps) {
-          const centerIdx = Math.round(t * SAMPLE_RATE);
-          const windowSamples = samples.slice(
-            Math.max(0, centerIdx - 400),
-            Math.min(samples.length, centerIdx + 400)
-          );
-          const energy = computeRMS(windowSamples);
-          if (energy > bestEnergy) {
-            bestEnergy = energy;
-            strongestTimeSec = t;
-          }
-        }
-      }
-
-      const shape = extractKnockPulseShape(samples, SAMPLE_RATE, strongestTimeSec);
-      setPendingKnockSample({ uri, shape, pulseCount });
+      setPendingKnockSample({ uri, embedding, rms });
       setStatus('🎧 استمع للعينة وتأكد أنها التقطت الطرقة بوضوح، ثم اعتمدها أو أعد التسجيل');
     } catch (err) {
       Alert.alert('خطأ', 'حدث خطأ أثناء التسجيل: ' + err.message);
@@ -267,9 +243,9 @@ export default function CalibrationScreen({ onCalibrationComplete }) {
   }
 
   async function handleAcceptPendingKnock() {
-    if (!pendingKnockSample || !pendingKnockSample.shape) return;
-    const updated = [...knockShapesCollected, pendingKnockSample.shape];
-    setKnockShapesCollected(updated);
+    if (!pendingKnockSample) return;
+    const updated = [...collectedKnockEmbeddings, pendingKnockSample.embedding];
+    setCollectedKnockEmbeddings(updated);
 
     await cleanupPlayingSound();
     await deleteTempFile(pendingKnockSample.uri);
@@ -296,7 +272,7 @@ export default function CalibrationScreen({ onCalibrationComplete }) {
       await deleteTempFile(pendingKnockSample.uri);
       setPendingKnockSample(null);
     }
-    setKnockShapesCollected([]);
+    setCollectedKnockEmbeddings([]);
     setStatus('تم مسح عينات طرق الباب. سجّلها من جديد.');
   }
 
@@ -310,12 +286,8 @@ export default function CalibrationScreen({ onCalibrationComplete }) {
       return;
     }
 
-    if (pendingSample) {
-      Alert.alert('عينة منبه بانتظار المراجعة', 'اعتمد العينة المسجّلة أو ألغِها أولًا قبل إنهاء الإعداد');
-      return;
-    }
-    if (pendingKnockSample) {
-      Alert.alert('عينة طرق بانتظار المراجعة', 'اعتمد العينة المسجّلة أو ألغِها أولًا قبل إنهاء الإعداد');
+    if (pendingSample || pendingKnockSample) {
+      Alert.alert('عينة بانتظار المراجعة', 'اعتمد العينة المسجّلة أو ألغِها أولًا قبل إنهاء الإعداد');
       return;
     }
 
@@ -324,21 +296,21 @@ export default function CalibrationScreen({ onCalibrationComplete }) {
       return;
     }
 
-    if (alarmDetectionEnabled && collectedAlarmSamples.length < SAMPLES_NEEDED) {
+    if (alarmDetectionEnabled && collectedAlarmEmbeddings.length < SAMPLES_NEEDED) {
       Alert.alert('تنبيه', `لازم تسجل ${SAMPLES_NEEDED} عينات منبه على الأقل، أو عطّل مسار كشف المنبه أعلاه`);
       return;
     }
 
-    if (knockDetectionEnabled && knockCalibrationEnabled && knockShapesCollected.length < KNOCK_SAMPLES_NEEDED) {
-      Alert.alert(
-        'تنبيه',
-        `فعّلت معايرة طرق الباب لكن لم تكمل ${KNOCK_SAMPLES_NEEDED} طرقات بعد. أكملها، أو عطّل مفتاح "معايرة طرق الباب" لاستخدام الكشف العام بدلًا منها`
-      );
+    if (knockDetectionEnabled && collectedKnockEmbeddings.length < KNOCK_SAMPLES_NEEDED) {
+      Alert.alert('تنبيه', `لازم تسجل ${KNOCK_SAMPLES_NEEDED} طرقات على الأقل، أو عطّل مسار كشف الطرق أعلاه`);
       return;
     }
 
     if (alarmDetectionEnabled) {
-      await saveAlarmReferenceSamples(collectedAlarmSamples);
+      await saveAlarmReferenceEmbeddings(collectedAlarmEmbeddings);
+    }
+    if (knockDetectionEnabled) {
+      await saveKnockReferenceEmbeddings(collectedKnockEmbeddings);
     }
 
     await savePhoneNumber(phoneNumber.trim());
@@ -346,13 +318,6 @@ export default function CalibrationScreen({ onCalibrationComplete }) {
       alarmEnabled: alarmDetectionEnabled,
       knockEnabled: knockDetectionEnabled,
     });
-
-    if (knockDetectionEnabled && knockCalibrationEnabled) {
-      const profile = averageKnockShapes(knockShapesCollected);
-      await saveKnockCalibration({ enabled: true, profile });
-    } else {
-      await saveKnockCalibration({ enabled: false, profile: null });
-    }
 
     Alert.alert('تم الحفظ', 'تم حفظ إعدادات المراقبة بنجاح', [
       { text: 'حسنًا', onPress: () => onCalibrationComplete() },
@@ -362,6 +327,13 @@ export default function CalibrationScreen({ onCalibrationComplete }) {
   return (
     <ScrollView contentContainerStyle={styles.container}>
       <Text style={styles.title}>⚙️ إعداد المراقبة</Text>
+
+      {isModelLoading && (
+        <View style={styles.modelLoadingBox}>
+          <ActivityIndicator color="#60a5fa" />
+          <Text style={styles.modelLoadingText}>جاري تحميل نموذج التعرف الصوتي (مرة واحدة فقط)...</Text>
+        </View>
+      )}
 
       <Text style={styles.label}>رقم الهاتف المستهدف:</Text>
       <TextInput
@@ -382,7 +354,7 @@ export default function CalibrationScreen({ onCalibrationComplete }) {
           <Switch value={alarmDetectionEnabled} onValueChange={setAlarmDetectionEnabled} />
         </View>
         <View style={styles.toggleRow}>
-          <Text style={styles.toggleLabel}>🚪 كشف طرق الباب (بدون معايرة إلزامية)</Text>
+          <Text style={styles.toggleLabel}>🚪 كشف طرق الباب (يحتاج معايرة)</Text>
           <Switch value={knockDetectionEnabled} onValueChange={setKnockDetectionEnabled} />
         </View>
       </View>
@@ -393,11 +365,13 @@ export default function CalibrationScreen({ onCalibrationComplete }) {
 
           <Text style={styles.label}>معايرة صوت المنبه:</Text>
           <Text style={styles.hint}>
-            سجّل {SAMPLES_NEEDED} عينات من صوت المنبه الحقيقي (كل عينة {(CALIBRATION_CHUNK_MS / 1000).toFixed(1)} ثانية) لبناء ملف مرجعي دقيق يشمل الشكل الطيفي والزمني والإيقاعي للصوت.
+            سجّل {SAMPLES_NEEDED} عينات من صوت المنبه الحقيقي (كل عينة {(CHUNK_MS / 1000).toFixed(1)} ثانية).
+            كل عينة تُحوَّل تلقائيًا إلى بصمة صوتية (Embedding) عبر نموذج ذكاء اصطناعي جاهز، وتُقارَن لاحقًا
+            بأقرب تطابق أثناء المراقبة.
           </Text>
 
           <Text style={styles.progress}>
-            العينات المعتمدة: {samplesCollected} / {SAMPLES_NEEDED}
+            العينات المعتمدة: {collectedAlarmEmbeddings.length} / {SAMPLES_NEEDED}
           </Text>
 
           <TouchableOpacity
@@ -418,17 +392,12 @@ export default function CalibrationScreen({ onCalibrationComplete }) {
               <Text
                 style={[
                   styles.reviewQuality,
-                  pendingSample.features.rms < MIN_GOOD_ENERGY_RMS
-                    ? styles.reviewQualityWeak
-                    : styles.reviewQualityGood,
+                  pendingSample.rms < MIN_GOOD_ENERGY_RMS ? styles.reviewQualityWeak : styles.reviewQualityGood,
                 ]}
               >
-                {pendingSample.features.rms < MIN_GOOD_ENERGY_RMS
+                {pendingSample.rms < MIN_GOOD_ENERGY_RMS
                   ? '⚠️ الصوت خافت — قرّب الهاتف من مصدر الصوت أو ارفع مستواه، وأعد التسجيل'
                   : '✅ مستوى الصوت جيد'}
-              </Text>
-              <Text style={styles.reviewMeta}>
-                التردد الأساسي المكتشف: {pendingSample.features.dominantFreq.toFixed(0)} Hz
               </Text>
 
               <TouchableOpacity style={styles.playButton} onPress={handlePlayPending}>
@@ -446,7 +415,7 @@ export default function CalibrationScreen({ onCalibrationComplete }) {
             </View>
           )}
 
-          {samplesCollected > 0 && (
+          {collectedAlarmEmbeddings.length > 0 && (
             <TouchableOpacity style={styles.secondaryButton} onPress={handleReset}>
               <Text style={styles.secondaryButtonText}>إعادة تعيين عينات المنبه</Text>
             </TouchableOpacity>
@@ -458,78 +427,65 @@ export default function CalibrationScreen({ onCalibrationComplete }) {
         <>
           <View style={styles.divider} />
 
-          <View style={styles.toggleRow}>
-            <Text style={styles.toggleLabel}>🎯 معايرة طرق الباب (اختياري، لدقة أعلى)</Text>
-            <Switch value={knockCalibrationEnabled} onValueChange={setKnockCalibrationEnabled} />
-          </View>
+          <Text style={styles.label}>معايرة طرق الباب:</Text>
+          <Text style={styles.hint}>
+            سجّل {KNOCK_SAMPLES_NEEDED} طرقات حقيقية على بابك (طرقة واحدة في كل تسجيل) لبناء بصمة صوتية
+            خاصة بصوت طرق هذا الباب بالذات.
+          </Text>
 
-          {knockCalibrationEnabled && (
-            <>
-              <Text style={styles.hint}>
-                سجّل {KNOCK_SAMPLES_NEEDED} طرقات حقيقية على بابك (طرقة واحدة في كل تسجيل) لبناء بصمة
-                خاصة بصوت طرق هذا الباب بالذات، بدلًا من الاعتماد على نطاقات عامة لأي طرقة.
-              </Text>
+          <Text style={styles.progress}>
+            الطرقات المعتمدة: {collectedKnockEmbeddings.length} / {KNOCK_SAMPLES_NEEDED}
+          </Text>
 
-              <Text style={styles.progress}>
-                الطرقات المعتمدة: {knockShapesCollected.length} / {KNOCK_SAMPLES_NEEDED}
-              </Text>
+          <TouchableOpacity
+            style={[styles.button, (isRecordingKnock || pendingKnockSample) && styles.buttonDisabled]}
+            onPress={handleRecordKnockSample}
+            disabled={isRecordingKnock || !!pendingKnockSample}
+          >
+            {isRecordingKnock ? (
+              <ActivityIndicator color="#fff" />
+            ) : (
+              <Text style={styles.buttonText}>🚪 تسجيل طرقة</Text>
+            )}
+          </TouchableOpacity>
 
-              <TouchableOpacity
-                style={[styles.button, (isRecordingKnock || pendingKnockSample) && styles.buttonDisabled]}
-                onPress={handleRecordKnockSample}
-                disabled={isRecordingKnock || !!pendingKnockSample}
+          {pendingKnockSample && (
+            <View style={styles.reviewBox}>
+              <Text style={styles.reviewTitle}>🎧 مراجعة الطرقة قبل الاعتماد</Text>
+              <Text
+                style={[
+                  styles.reviewQuality,
+                  pendingKnockSample.rms < MIN_GOOD_ENERGY_RMS
+                    ? styles.reviewQualityWeak
+                    : styles.reviewQualityGood,
+                ]}
               >
-                {isRecordingKnock ? (
-                  <ActivityIndicator color="#fff" />
-                ) : (
-                  <Text style={styles.buttonText}>🚪 تسجيل طرقة</Text>
-                )}
+                {pendingKnockSample.rms < MIN_GOOD_ENERGY_RMS
+                  ? '⚠️ الصوت خافت جدًا — اطرق بقوة أكبر وأعد المحاولة'
+                  : '✅ مستوى الصوت جيد'}
+              </Text>
+
+              <TouchableOpacity style={styles.playButton} onPress={handlePlayPendingKnock}>
+                <Text style={styles.buttonText}>
+                  {isPlaying ? '⏸️ جاري التشغيل...' : '▶️ استماع للعينة'}
+                </Text>
               </TouchableOpacity>
 
-              {pendingKnockSample && (
-                <View style={styles.reviewBox}>
-                  <Text style={styles.reviewTitle}>🎧 مراجعة الطرقة قبل الاعتماد</Text>
-
-                  {pendingKnockSample.pulseCount === 0 ? (
-                    <Text style={[styles.reviewQuality, styles.reviewQualityWeak]}>
-                      ⚠️ لم يُكتشف طرق واضح — اطرق بقوة أكبر وأعد المحاولة
-                    </Text>
-                  ) : (
-                    <Text style={[styles.reviewQuality, styles.reviewQualityGood]}>
-                      ✅ تم اكتشاف الطرقة بوضوح ({pendingKnockSample.pulseCount} نبضة)
-                    </Text>
-                  )}
-
-                  <TouchableOpacity style={styles.playButton} onPress={handlePlayPendingKnock}>
-                    <Text style={styles.buttonText}>
-                      {isPlaying ? '⏸️ جاري التشغيل...' : '▶️ استماع للعينة'}
-                    </Text>
-                  </TouchableOpacity>
-
-                  <View style={styles.reviewActionsRow}>
-                    <TouchableOpacity style={styles.rejectButton} onPress={handleRejectPendingKnock}>
-                      <Text style={styles.buttonText}>🔁 إعادة التسجيل</Text>
-                    </TouchableOpacity>
-                    <TouchableOpacity
-                      style={[
-                        styles.acceptButton,
-                        pendingKnockSample.pulseCount === 0 && styles.buttonDisabled,
-                      ]}
-                      onPress={handleAcceptPendingKnock}
-                      disabled={pendingKnockSample.pulseCount === 0}
-                    >
-                      <Text style={styles.buttonText}>✅ اعتماد الطرقة</Text>
-                    </TouchableOpacity>
-                  </View>
-                </View>
-              )}
-
-              {knockShapesCollected.length > 0 && (
-                <TouchableOpacity style={styles.secondaryButton} onPress={handleResetKnock}>
-                  <Text style={styles.secondaryButtonText}>إعادة تعيين طرقات المعايرة</Text>
+              <View style={styles.reviewActionsRow}>
+                <TouchableOpacity style={styles.rejectButton} onPress={handleRejectPendingKnock}>
+                  <Text style={styles.buttonText}>🔁 إعادة التسجيل</Text>
                 </TouchableOpacity>
-              )}
-            </>
+                <TouchableOpacity style={styles.acceptButton} onPress={handleAcceptPendingKnock}>
+                  <Text style={styles.buttonText}>✅ اعتماد الطرقة</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          )}
+
+          {collectedKnockEmbeddings.length > 0 && (
+            <TouchableOpacity style={styles.secondaryButton} onPress={handleResetKnock}>
+              <Text style={styles.secondaryButtonText}>إعادة تعيين طرقات المعايرة</Text>
+            </TouchableOpacity>
           )}
         </>
       )}
@@ -556,6 +512,20 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
     marginBottom: 20,
     textAlign: 'center',
+  },
+  modelLoadingBox: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#1e293b',
+    borderRadius: 10,
+    padding: 12,
+    marginBottom: 16,
+  },
+  modelLoadingText: {
+    color: '#93c5fd',
+    fontSize: 12,
+    marginLeft: 8,
   },
   label: {
     color: '#ccc',
@@ -627,12 +597,6 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     marginBottom: 8,
     lineHeight: 19,
-  },
-  reviewMeta: {
-    color: '#94a3b8',
-    fontSize: 12,
-    textAlign: 'center',
-    marginBottom: 12,
   },
   reviewQualityGood: {
     color: '#4ade80',
