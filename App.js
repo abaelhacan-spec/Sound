@@ -3,6 +3,7 @@ import { StatusBar } from 'expo-status-bar';
 import { View, ActivityIndicator, StyleSheet } from 'react-native';
 import CalibrationScreen from './screens/CalibrationScreen';
 import MonitoringScreen from './screens/MonitoringScreen';
+import DiagnosticScreen from './screens/DiagnosticScreen';
 import {
   loadAlarmReferenceEmbeddings,
   loadKnockReferenceEmbeddings,
@@ -12,7 +13,8 @@ import {
 
 export default function App() {
   const [isLoading, setIsLoading] = useState(true);
-  const [currentScreen, setCurrentScreen] = useState('calibration'); // 'calibration' | 'monitoring'
+  // أضفنا 'diagnostic' كشاشة ثالثة — يمكن الوصول إليها من شاشة المعايرة
+  const [currentScreen, setCurrentScreen] = useState('calibration'); // 'calibration' | 'monitoring' | 'diagnostic'
 
   useEffect(() => {
     checkExistingSetup();
@@ -49,9 +51,14 @@ export default function App() {
     <View style={{ flex: 1 }}>
       <StatusBar style="light" />
       {currentScreen === 'calibration' ? (
-        <CalibrationScreen onCalibrationComplete={() => setCurrentScreen('monitoring')} />
-      ) : (
+        <CalibrationScreen
+          onCalibrationComplete={() => setCurrentScreen('monitoring')}
+          onOpenDiagnostic={() => setCurrentScreen('diagnostic')}
+        />
+      ) : currentScreen === 'monitoring' ? (
         <MonitoringScreen onBackToSettings={() => setCurrentScreen('calibration')} />
+      ) : (
+        <DiagnosticScreen onBack={() => setCurrentScreen('calibration')} />
       )}
     </View>
   );
