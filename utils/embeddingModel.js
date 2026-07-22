@@ -14,9 +14,22 @@ import { loadTensorflowModel } from 'react-native-fast-tflite';
  */
 
 const SAMPLE_RATE = 16000;
-// YAMNet يحتاج 0.975 ثانية على الأقل من الصوت لإنتاج أول إطار embedding
-// (نافذة 0.96 ثانية + هامش أمان بسيط لضمان عدم القطع).
-const MIN_SAMPLES_REQUIRED = Math.ceil(0.975 * SAMPLE_RATE);
+
+// ⚠️ تصحيح جوهري: نسخة YAMNet TFLite الرسمية (lite-model/yamnet/tflite/1)
+// تتوقع مدخلًا بطول ثابت تحديدًا = 15600 عينة (0.975 ثانية عند 16kHz)،
+// وليس طولًا متغيرًا كما في نسخة TensorFlow SavedModel الكاملة. إرسال
+// مقطع أطول (كالثانيتين المستخدمتين في هذا التطبيق) دفعة واحدة لنموذج
+// بشكل مدخل ثابت قد يُنتج نتائج غير معرَّفة (قد تبدو متطابقة دائمًا،
+// كما لاحظنا: تشابه 100% حتى بين أصوات مختلفة تمامًا)، لأن المكتبة قد
+// تقرأ جزءًا غير صحيح من الذاكرة أو تتجاهل الفائض بصمت دون رمي خطأ.
+//
+// الحل: نقسّم أي مقطع أطول من الحجم الرسمي إلى إطارات متتالية، كل واحد
+// بطول 15600 عينة بالضبط (نُكمّل آخر إطار ناقص بالأصفار عند الحاجة)،
+// ونُشغّل النموذج على كل إطار بشكل منفصل، ثم نأخذ متوسط كل الـ embeddings
+// الناتجة لتمثيل المقطع كاملاً — بدل الاعتماد على المكتبة لتقسيم الطول
+// تلقائيًا داخليًا.
+const MODEL_INPUT_SIZE = 15600;
+const EMBED_DIM = 1024;
 
 let modelPromise = null;
 
@@ -32,33 +45,12 @@ export function loadEmbeddingModel() {
 }
 
 /**
- * يستخرج "بصمة" (Embedding) واحدة تمثّل المقطع الصوتي بأكمله.
- *
- * YAMNet يُدخِل الصوت الخام (waveform) مباشرة، ويُخرِج مصفوفة أطر
- * (Frames) — إطار واحد لكل نافذة 0.96 ثانية (بتراكب 50%). كل إطار هو
- * متجه بحجم 1024. بما أن مقاطعنا (1.2 - 2.5 ثانية) قد تنتج أكثر من إطار
- * واحد، نأخذ متوسط كل الأطر الناتجة لإنتاج متجه واحد يمثل المقطع كاملاً
- * — بنفس فلسفة averageFingerprints المستخدمة سابقًا مع FFT.
- *
- * @param {number[]} samples عينات صوتية مطبّعة بين -1 و 1 (16kHz، مونو)
- * @param {object} model الكائن المُرجَع من loadEmbeddingModel()
- * @returns {Promise<number[]>} متجه Embedding بحجم 1024
+ * يستخرج embedding واحد (1024 رقم) من إطار صوتي واحد بطول MODEL_INPUT_SIZE
+ * بالضبط. هذا هو "استدعاء النموذج الصحيح" وفق الشكل الذي بُني عليه فعليًا.
  */
-export async function extractEmbedding(samples, model) {
-  let input = samples;
-
-  // لو المقطع أقصر من الحد الأدنى المطلوب، نكمّله بالأصفار (صمت) بدل
-  // رفض المقطع، لأن هذا نادر الحدوث ولا يستحق تعقيد إضافي في الواجهة.
-  if (input.length < MIN_SAMPLES_REQUIRED) {
-    const padded = new Array(MIN_SAMPLES_REQUIRED).fill(0);
-    for (let i = 0; i < input.length; i++) padded[i] = input[i];
-    input = padded;
-  }
-
-  const inputArray = Float32Array.from(input);
+async function runModelOnSingleFrame(frameSamples, model) {
+  const inputArray = Float32Array.from(frameSamples);
   const outputs = await model.run([inputArray]);
-
-  const EMBED_DIM = 1024;
 
   // مخرجات YAMNet TFLite الرسمية بالترتيب المتوقَّع: [scores, embeddings, spectrogram].
   // لكن بعض إصدارات react-native-fast-tflite قد تُرجع المخرجات بترتيب مختلف
@@ -71,7 +63,6 @@ export async function extractEmbedding(samples, model) {
   }
 
   // المحاولة 2: ابحث بين كل المخرجات عن أول tensor طوله مضاعف لـ 1024
-  // — هذا بالضرورة tensor الـ embeddings، بغض النظر عن ترتيبه الفعلي.
   if (!embeddingsFlat && outputs) {
     for (let i = 0; i < outputs.length; i++) {
       const t = outputs[i];
@@ -82,8 +73,6 @@ export async function extractEmbedding(samples, model) {
     }
   }
 
-  // المحاولة 3: فشل كل شيء → رسالة خطأ تفصيلية تُظهر أحجام كل المخرجات
-  // لتسهيل التشخيص لاحقًا بدل رسالة "length of undefined" المبهمة.
   if (!embeddingsFlat) {
     const shapesInfo = outputs
       ? outputs.map((t, i) => `outputs[${i}]: ${t ? t.length : 'undefined'}`).join(', ')
@@ -94,12 +83,19 @@ export async function extractEmbedding(samples, model) {
     );
   }
 
+  // مع مدخل بطول MODEL_INPUT_SIZE بالضبط (إطار واحد فقط)، يُفترض أن يُنتج
+  // النموذج إطار embedding واحد بالضبط (1024 رقم). نحتفظ بمنطق قسمة
+  // numFrames احتياطيًا فقط تحسبًا لأي سلوك داخلي غير متوقَّع من المكتبة.
   const numFrames = Math.floor(embeddingsFlat.length / EMBED_DIM);
-
   if (numFrames <= 0) {
     throw new Error('تعذّر استخراج أي إطار Embedding من هذا المقطع');
   }
 
+  if (numFrames === 1) {
+    return Array.from(embeddingsFlat.slice(0, EMBED_DIM));
+  }
+
+  // احتياطي: لو أنتجت المكتبة أكثر من إطار رغم كل شيء، نأخذ متوسطها
   const avg = new Array(EMBED_DIM).fill(0);
   for (let f = 0; f < numFrames; f++) {
     const offset = f * EMBED_DIM;
@@ -107,6 +103,61 @@ export async function extractEmbedding(samples, model) {
       avg[i] += embeddingsFlat[offset + i] / numFrames;
     }
   }
+  return avg;
+}
 
+/**
+ * يستخرج "بصمة" (Embedding) واحدة تمثّل مقطعًا صوتيًا كاملاً، بغض النظر
+ * عن طوله. يُقسِّم المقطع داخليًا إلى إطارات متتالية بطول MODEL_INPUT_SIZE
+ * بالضبط (الحجم الرسمي الذي يتوقعه النموذج)، يُشغِّل النموذج على كل إطار
+ * على حدة، ثم يأخذ متوسط كل الـ embeddings الناتجة لتمثيل المقطع كاملاً.
+ *
+ * @param {number[]} samples عينات صوتية مطبّعة بين -1 و 1 (16kHz، مونو)
+ * @param {object} model الكائن المُرجَع من loadEmbeddingModel()
+ * @returns {Promise<number[]>} متجه Embedding بحجم 1024
+ */
+export async function extractEmbedding(samples, model) {
+  if (!samples || samples.length === 0) {
+    throw new Error('لا توجد عينات صوتية لاستخراج البصمة منها');
+  }
+
+  // نقسّم المقطع إلى إطارات متتالية غير متراكبة، كل واحد بطول
+  // MODEL_INPUT_SIZE بالضبط. الإطار الأخير الناقص يُكمَّل بالأصفار (صمت)
+  // بدل تجاهله، حفاظًا على أي جزء من الصوت يقع في نهاية المقطع.
+  const frames = [];
+  for (let start = 0; start < samples.length; start += MODEL_INPUT_SIZE) {
+    const end = Math.min(start + MODEL_INPUT_SIZE, samples.length);
+    const frame = new Array(MODEL_INPUT_SIZE).fill(0);
+    for (let i = start; i < end; i++) {
+      frame[i - start] = samples[i];
+    }
+    frames.push(frame);
+
+    // لو الإطار الأخير قصير جدًا (أقل من 10% من الحجم المطلوب)، لا يستحق
+    // تشغيل النموذج عليه (غالبًا صمت متبقٍ لا يحمل معلومة مفيدة)
+    if (end - start < MODEL_INPUT_SIZE * 0.1 && frames.length > 1) {
+      frames.pop();
+      break;
+    }
+  }
+
+  if (frames.length === 0) {
+    // مقطع أقصر من الحد الأدنى بكثير — إطار واحد مكمَّل بالأصفار
+    frames.push(new Array(MODEL_INPUT_SIZE).fill(0).map((_, i) => samples[i] || 0));
+  }
+
+  const frameEmbeddings = [];
+  for (const frame of frames) {
+    const emb = await runModelOnSingleFrame(frame, model);
+    frameEmbeddings.push(emb);
+  }
+
+  // متوسط كل embeddings الإطارات لتمثيل المقطع كاملاً بمتجه واحد
+  const avg = new Array(EMBED_DIM).fill(0);
+  for (const emb of frameEmbeddings) {
+    for (let i = 0; i < EMBED_DIM; i++) {
+      avg[i] += emb[i] / frameEmbeddings.length;
+    }
+  }
   return avg;
 }
