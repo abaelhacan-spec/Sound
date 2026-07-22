@@ -25,6 +25,8 @@ import {
   savePhoneNumber,
   loadPhoneNumber,
   saveDetectionPaths,
+  saveSimilarityThreshold,
+  loadSimilarityThreshold,
 } from '../utils/storage';
 
 // عدد العينات الأدنى المطلوب لكل صوت. كل عينة تُحوَّل إلى Embedding واحد
@@ -35,11 +37,15 @@ const SAMPLES_NEEDED = 5;
 const KNOCK_SAMPLES_NEEDED = 5;
 const CHUNK_MS = 2000; // كافية لتغطية نغمة المنبه أو الطرقة بالكامل، وأطول من حد YAMNet الأدنى (0.975s)
 const MIN_GOOD_ENERGY_RMS = 0.015; // نفس حد الطاقة الدنيا المستخدم أثناء المراقبة، لتنبيه المستخدم مبكرًا لو العينة خافتة جدًا
+const THRESHOLD_STEP = 0.05;
+const THRESHOLD_MIN = 0.5;
+const THRESHOLD_MAX = 0.95;
 
 export default function CalibrationScreen({ onCalibrationComplete }) {
   const [phoneNumber, setPhoneNumber] = useState('');
   const [alarmDetectionEnabled, setAlarmDetectionEnabled] = useState(true);
   const [knockDetectionEnabled, setKnockDetectionEnabled] = useState(true);
+  const [similarityThreshold, setSimilarityThreshold] = useState(0.75);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isModelLoading, setIsModelLoading] = useState(false);
   const soundRef = useRef(null);
@@ -74,7 +80,20 @@ export default function CalibrationScreen({ onCalibrationComplete }) {
     loadPhoneNumber().then((saved) => {
       if (saved) setPhoneNumber(saved);
     });
+    loadSimilarityThreshold().then((saved) => {
+      if (typeof saved === 'number' && !Number.isNaN(saved)) setSimilarityThreshold(saved);
+    });
   }, []);
+
+  /** يغيّر العتبة بخطوة ثابتة (±0.05) ويحفظها فورًا، بدون انتظار زر "حفظ الإعداد" */
+  async function adjustThreshold(delta) {
+    const next = Math.min(
+      THRESHOLD_MAX,
+      Math.max(THRESHOLD_MIN, Math.round((similarityThreshold + delta) * 100) / 100)
+    );
+    setSimilarityThreshold(next);
+    await saveSimilarityThreshold(next);
+  }
 
   /** يحمّل نموذج YAMNet مرة واحدة عند أول استخدام فعلي، وليس عند فتح الشاشة مباشرة */
   async function getModel() {
@@ -105,23 +124,32 @@ export default function CalibrationScreen({ onCalibrationComplete }) {
       return;
     }
 
+    let step = 'تحميل النموذج';
     try {
       setIsRecording(true);
       setStatus('🔴 جاري التسجيل... شغّل صوت المنبه الآن بجانب الهاتف');
 
       const model = await getModel();
+      step = 'ضبط وضع الصوت';
       await configureAudioMode();
+      step = 'فتح المايك وتسجيل المقطع';
       const uri = await recordChunk(CHUNK_MS);
+      if (!uri) throw new Error('لم يُرجِع المسجّل مسار ملف صالح (uri فارغ)');
+      step = 'قراءة ملف WAV';
       const samples = await readWavAsSamples(uri);
+      if (!samples || samples.length === 0) {
+        throw new Error('ملف الصوت فارغ أو غير قابل للقراءة');
+      }
       const rms = computeRMS(samples);
 
+      step = 'استخراج البصمة عبر YAMNet';
       setStatus('🧠 جاري استخراج البصمة الصوتية...');
       const embedding = await extractEmbedding(samples, model);
 
       setPendingSample({ uri, embedding, rms });
       setStatus('🎧 استمع للعينة وتأكد من جودتها، ثم اعتمدها أو أعد التسجيل');
     } catch (err) {
-      Alert.alert('خطأ', 'حدث خطأ أثناء التسجيل: ' + err.message);
+      Alert.alert('خطأ في خطوة: ' + step, err?.message || String(err));
     } finally {
       setIsRecording(false);
     }
@@ -200,23 +228,32 @@ export default function CalibrationScreen({ onCalibrationComplete }) {
       return;
     }
 
+    let step = 'تحميل النموذج';
     try {
       setIsRecordingKnock(true);
       setStatus('🔴 جاري التسجيل... اطرق الباب مرة واحدة بقوة اعتيادية الآن');
 
       const model = await getModel();
+      step = 'ضبط وضع الصوت';
       await configureAudioMode();
+      step = 'فتح المايك وتسجيل المقطع';
       const uri = await recordChunk(CHUNK_MS);
+      if (!uri) throw new Error('لم يُرجِع المسجّل مسار ملف صالح (uri فارغ)');
+      step = 'قراءة ملف WAV';
       const samples = await readWavAsSamples(uri);
+      if (!samples || samples.length === 0) {
+        throw new Error('ملف الصوت فارغ أو غير قابل للقراءة');
+      }
       const rms = computeRMS(samples);
 
+      step = 'استخراج البصمة عبر YAMNet';
       setStatus('🧠 جاري استخراج البصمة الصوتية...');
       const embedding = await extractEmbedding(samples, model);
 
       setPendingKnockSample({ uri, embedding, rms });
       setStatus('🎧 استمع للعينة وتأكد أنها التقطت الطرقة بوضوح، ثم اعتمدها أو أعد التسجيل');
     } catch (err) {
-      Alert.alert('خطأ', 'حدث خطأ أثناء التسجيل: ' + err.message);
+      Alert.alert('خطأ في خطوة: ' + step, err?.message || String(err));
     } finally {
       setIsRecordingKnock(false);
     }
@@ -357,6 +394,33 @@ export default function CalibrationScreen({ onCalibrationComplete }) {
           <Text style={styles.toggleLabel}>🚪 كشف طرق الباب (يحتاج معايرة)</Text>
           <Switch value={knockDetectionEnabled} onValueChange={setKnockDetectionEnabled} />
         </View>
+      </View>
+
+      <View style={styles.divider} />
+
+      <Text style={styles.label}>🎚️ حساسية التعرف (العتبة):</Text>
+      <Text style={styles.hint}>
+        كلما قلّت القيمة زادت الحساسية (يلتقط أسهل، لكن احتمال اتصالات خاطئة أكبر).
+        كلما زادت القيمة قلّت الحساسية (دقة أعلى، لكن قد يفوّت الصوت أحيانًا).
+      </Text>
+      <View style={styles.thresholdRow}>
+        <TouchableOpacity
+          style={styles.thresholdButton}
+          onPress={() => adjustThreshold(-THRESHOLD_STEP)}
+          disabled={similarityThreshold <= THRESHOLD_MIN}
+        >
+          <Text style={styles.thresholdButtonText}>−</Text>
+        </TouchableOpacity>
+
+        <Text style={styles.thresholdValue}>{similarityThreshold.toFixed(2)}</Text>
+
+        <TouchableOpacity
+          style={styles.thresholdButton}
+          onPress={() => adjustThreshold(THRESHOLD_STEP)}
+          disabled={similarityThreshold >= THRESHOLD_MAX}
+        >
+          <Text style={styles.thresholdButtonText}>+</Text>
+        </TouchableOpacity>
       </View>
 
       {alarmDetectionEnabled && (
@@ -575,6 +639,33 @@ const styles = StyleSheet.create({
     color: '#4CAF50',
     fontSize: 15,
     marginBottom: 16,
+    textAlign: 'center',
+  },
+  thresholdRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 8,
+  },
+  thresholdButton: {
+    backgroundColor: '#2563eb',
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  thresholdButtonText: {
+    color: '#fff',
+    fontSize: 24,
+    fontWeight: '700',
+  },
+  thresholdValue: {
+    color: '#fff',
+    fontSize: 22,
+    fontWeight: '700',
+    marginHorizontal: 24,
+    minWidth: 70,
     textAlign: 'center',
   },
   reviewBox: {
