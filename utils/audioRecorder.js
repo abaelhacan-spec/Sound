@@ -1,67 +1,139 @@
+import { Platform } from 'react-native';
 import { Audio } from 'expo-av';
 import * as FileSystem from 'expo-file-system';
 
-/**
- * يسجل مقطع صوت قصير (WAV, 16kHz, mono) لمدة محددة بالمللي ثانية،
- * ثم يرجع مسار الملف المؤقت.
- *
- * ─── Bug #2 الذي كان موجودًا (مُصلَح هنا) ────────────────────────────────
- * الكود القديم كان يستخدم:
- *   outputFormat: Audio.AndroidOutputFormat.DEFAULT   (= 0)
- *   audioEncoder: Audio.AndroidAudioEncoder.DEFAULT   (= 0)
- *
- * القيمة DEFAULT=0 على Android لا تعني "أفضل جودة" بل تعني حرفيًا:
- *   OutputFormat.DEFAULT → THREE_GPP (حاوية 3GPP) على كثير من الأجهزة
- *   AudioEncoder.DEFAULT → AMR_NB (ترميز صوتي مضغوط)
- *
- * النتيجة: الملف الناتج يحتوي صوتًا مضغوطًا (3GPP/AMR) وليس PCM خامًا،
- * رغم أن اسمه ينتهي بـ ".wav". عندما تحاول readWavAsSamples() قراءته
- * كـ PCM 16-bit من البايت 44، تقرأ بايتات من header 3GPP أو بيانات codec
- * مضغوطة وليس عينات صوتية حقيقية.
- *
- * بما أن header الـ 3GPP ثابتة تقريبًا في كل تسجيل، يرى YAMNet نفس
- * "الصوت المزيف" في كل مرة → embeddings متطابقة → تشابه 100%.
- *
- * ─── الإصلاح ──────────────────────────────────────────────────────────────
- * نستخدم MPEG_4 + AAC على Android مع تفعيل تنسيق PCM الخطي على iOS.
- * لكن المشكلة تبقى: MPEG_4/AAC ليس PCM خامًا أيضًا.
- *
- * ─── الحل الجذري ──────────────────────────────────────────────────────────
- * expo-av (v14) لا يدعم تسجيل PCM خام على Android عبر MediaRecorder.
- * الخيارات:
- *
- * الخيار A (مُطبَّق هنا): استخدام RecordingOptionsPresets.HIGH_QUALITY
- *   على iOS ينتج WAV PCM حقيقيًا.
- *   على Android ينتج AAC/M4A — لكن readWavAsSamples() ستكتشف ذلك وترمي
- *   خطأً واضحًا بدلاً من قراءة بيانات خاطئة بصمت.
- *
- * الخيار B (موصى به للإنتاج): استخدام مكتبة expo-audio (SDK 52+) أو
- *   react-native-audio-recorder-player التي تدعم PCM خامًا على Android.
- *
- * الخيار C (بديل): تسجيل بصيغة AAC/M4A وفك ضغطها باستخدام مكتبة codec.
- *
- * ملاحظة: إذا كان التطبيق يعمل على iOS فقط، الإصلاح في audioFingerprint.js
- * (تحليل WAV header بشكل صحيح) كافٍ وحده لحل مشكلة الـ embeddings المتطابقة.
- */
-export async function recordChunk(durationMs = 1000) {
+// ─── Android: react-native-audio-record ───────────────────────────────────────
+// expo-av على Android يستخدم MediaRecorder وهو لا يدعم PCM خاماً أبداً.
+// react-native-audio-record تستخدم AudioRecord (API منخفض المستوى) وتنتج
+// PCM 16-bit حقيقياً كـ chunks base64 عبر event callbacks.
+// نجمع الـ chunks، نبني WAV صحيحاً في الذاكرة، نكتبه لـ cacheDirectory،
+// ونُعيد URI — نفس واجهة iOS تماماً، دون تغيير في بقية الكود.
+// ─── iOS: expo-av ─────────────────────────────────────────────────────────────
+// يُنتج LinearPCM WAV صحيحاً مباشرةً — لا تغيير مطلوب.
+// ─────────────────────────────────────────────────────────────────────────────
+
+let AudioRecord = null;
+if (Platform.OS === 'android') {
+  try {
+    AudioRecord = require('react-native-audio-record').default;
+  } catch (e) {
+    console.error('[audioRecorder] react-native-audio-record غير مثبّتة:', e.message);
+  }
+}
+
+// ─── بناء WAV header (44 بايت) ────────────────────────────────────────────────
+function buildWavHeader(numSamples, sampleRate, channels, bitsPerSample) {
+  const dataSize = numSamples * channels * (bitsPerSample / 8);
+  const buffer = new ArrayBuffer(44);
+  const v = new DataView(buffer);
+
+  const write4 = (offset, str) => {
+    for (let i = 0; i < 4; i++) v.setUint8(offset + i, str.charCodeAt(i));
+  };
+
+  write4(0, 'RIFF');
+  v.setUint32(4, 36 + dataSize, true);
+  write4(8, 'WAVE');
+  write4(12, 'fmt ');
+  v.setUint32(16, 16, true);          // fmt chunk size
+  v.setUint16(20, 1, true);           // PCM = 1
+  v.setUint16(22, channels, true);
+  v.setUint32(24, sampleRate, true);
+  v.setUint32(28, sampleRate * channels * (bitsPerSample / 8), true);
+  v.setUint16(32, channels * (bitsPerSample / 8), true);
+  v.setUint16(34, bitsPerSample, true);
+  write4(36, 'data');
+  v.setUint32(40, dataSize, true);
+
+  return new Uint8Array(buffer);
+}
+
+// ─── تحويل Uint8Array إلى base64 (آمن للمصفوفات الكبيرة) ─────────────────────
+function uint8ToBase64(bytes) {
+  let binary = '';
+  const chunkSize = 8192;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+// ─── تسجيل Android عبر react-native-audio-record ────────────────────────────
+async function recordChunkAndroid(durationMs) {
+  if (!AudioRecord) {
+    throw new Error(
+      'react-native-audio-record غير متاحة.\n' +
+      'شغّل: npm install react-native-audio-record\n' +
+      'ثم: npx expo prebuild && npx expo run:android'
+    );
+  }
+
+  const SAMPLE_RATE = 16000;
+  const CHANNELS = 1;
+  const BITS = 16;
+
+  AudioRecord.init({
+    sampleRate: SAMPLE_RATE,
+    channels: CHANNELS,
+    bitsPerSample: BITS,
+    audioSource: 6, // VOICE_RECOGNITION — أفضل لتسجيل الصوت البشري
+    // بدون wavFile → streaming mode → لا حاجة لأذونات التخزين
+  });
+
+  const pcmChunks = [];
+  const subscription = AudioRecord.on('data', (b64) => {
+    // كل chunk: سلسلة base64 تمثل bytes من PCM 16-bit signed little-endian
+    const binary = atob(b64);
+    const chunk = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) chunk[i] = binary.charCodeAt(i);
+    pcmChunks.push(chunk);
+  });
+
+  AudioRecord.start();
+  await new Promise((resolve) => setTimeout(resolve, durationMs));
+  await AudioRecord.stop();
+  subscription.remove();
+
+  // ─── دمج كل الـ chunks في مصفوفة واحدة ──────────────────────────────────
+  const totalBytes = pcmChunks.reduce((sum, c) => sum + c.length, 0);
+  const pcmBytes = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of pcmChunks) {
+    pcmBytes.set(chunk, offset);
+    offset += chunk.length;
+  }
+
+  if (totalBytes === 0) {
+    throw new Error(
+      'لم يُستلم أي بيانات صوتية من AudioRecord.\n' +
+      'تأكد من منح إذن RECORD_AUDIO.'
+    );
+  }
+
+  // ─── بناء WAV صحيح في الذاكرة ────────────────────────────────────────────
+  const numSamples = totalBytes / (BITS / 8);
+  const wavHeader = buildWavHeader(numSamples, SAMPLE_RATE, CHANNELS, BITS);
+
+  const wavBytes = new Uint8Array(44 + totalBytes);
+  wavBytes.set(wavHeader, 0);
+  wavBytes.set(pcmBytes, 44);
+
+  // ─── كتابة إلى cacheDirectory وإعادة URI ─────────────────────────────────
+  const uri = FileSystem.cacheDirectory + `rec_android_${Date.now()}.wav`;
+  await FileSystem.writeAsStringAsync(uri, uint8ToBase64(wavBytes), {
+    encoding: FileSystem.EncodingType.Base64,
+  });
+
+  return uri;
+}
+
+// ─── تسجيل iOS عبر expo-av (PCM WAV حقيقي) ──────────────────────────────────
+async function recordChunkIOS(durationMs) {
   const recording = new Audio.Recording();
 
-  const recordingOptions = {
-    android: {
-      // ✅ مُصلَح: بدلاً من DEFAULT الذي ينتج 3GPP/AMR:
-      // MPEG_4 + AAC هو التنسيق الأكثر استقرارًا على Android.
-      // تحذير: لا يزال صوتًا مضغوطًا، لكن readWavAsSamples() ستكتشف ذلك
-      // وترمي خطأً واضحًا (بدلاً من قراءة بيانات خاطئة بصمت كما كان قبلاً).
-      // للحصول على PCM حقيقي على Android، انظر الخيار B في التعليق أعلاه.
-      extension: '.m4a',
-      outputFormat: Audio.AndroidOutputFormat.MPEG_4,
-      audioEncoder: Audio.AndroidAudioEncoder.AAC,
-      sampleRate: 16000,
-      numberOfChannels: 1,
-      bitRate: 128000,
-    },
+  await recording.prepareToRecordAsync({
+    android: {}, // لن يُستخدم
     ios: {
-      // ✅ iOS: WAV PCM 16-bit حقيقي — هذا هو الإعداد الصحيح
       extension: '.wav',
       audioQuality: Audio.IOSAudioQuality.HIGH,
       sampleRate: 16000,
@@ -72,23 +144,29 @@ export async function recordChunk(durationMs = 1000) {
       linearPCMIsFloat: false,
     },
     web: {},
-  };
+  });
 
-  await recording.prepareToRecordAsync(recordingOptions);
   await recording.startAsync();
-
   await new Promise((resolve) => setTimeout(resolve, durationMs));
-
   await recording.stopAndUnloadAsync();
-  const uri = recording.getURI();
-  return uri;
+
+  return recording.getURI();
+}
+
+// ─── الواجهة العامة ───────────────────────────────────────────────────────────
+
+export async function recordChunk(durationMs = 1000) {
+  if (Platform.OS === 'android') {
+    return recordChunkAndroid(durationMs);
+  }
+  return recordChunkIOS(durationMs);
 }
 
 export async function deleteTempFile(uri) {
   try {
     await FileSystem.deleteAsync(uri, { idempotent: true });
-  } catch (e) {
-    // تجاهل أخطاء الحذف (الملف ممكن يكون اتمسح بالفعل)
+  } catch (_) {
+    // تجاهل — الملف ممكن يكون اتمسح بالفعل
   }
 }
 
