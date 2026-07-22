@@ -41,7 +41,7 @@ const THRESHOLD_STEP = 0.05;
 const THRESHOLD_MIN = 0.5;
 const THRESHOLD_MAX = 0.95;
 
-export default function CalibrationScreen({ onCalibrationComplete }) {
+export default function CalibrationScreen({ onCalibrationComplete, onOpenDiagnostic }) {
   const [phoneNumber, setPhoneNumber] = useState('');
   const [alarmDetectionEnabled, setAlarmDetectionEnabled] = useState(true);
   const [knockDetectionEnabled, setKnockDetectionEnabled] = useState(true);
@@ -559,6 +559,12 @@ export default function CalibrationScreen({ onCalibrationComplete }) {
       <TouchableOpacity style={[styles.button, styles.finishButton]} onPress={handleFinishCalibration}>
         <Text style={styles.buttonText}>✅ حفظ وإنهاء الإعداد</Text>
       </TouchableOpacity>
+
+      {onOpenDiagnostic && (
+        <TouchableOpacity style={styles.diagnosticButton} onPress={onOpenDiagnostic}>
+          <Text style={styles.diagnosticButtonText}>🔬 فحص النموذج (تشخيص)</Text>
+        </TouchableOpacity>
+      )}
     </ScrollView>
   );
 }
@@ -756,5 +762,16 @@ const styles = StyleSheet.create({
   finishButton: {
     backgroundColor: '#16a34a',
     marginTop: 8,
+  },
+  diagnosticButton: {
+    padding: 12,
+    alignItems: 'center',
+    marginTop: 4,
+    marginBottom: 16,
+  },
+  diagnosticButtonText: {
+    color: '#475569',
+    fontSize: 13,
+    textDecorationLine: 'underline',
   },
 });
