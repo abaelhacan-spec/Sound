@@ -58,10 +58,42 @@ export async function extractEmbedding(samples, model) {
   const inputArray = Float32Array.from(input);
   const outputs = await model.run([inputArray]);
 
-  // مخرجات YAMNet TFLite الرسمية بالترتيب: [scores, embeddings, spectrogram]
-  // مصفوفة الـ embeddings مُسطَّحة (flattened) بشكل [numFrames * 1024].
-  const embeddingsFlat = outputs[1];
   const EMBED_DIM = 1024;
+
+  // مخرجات YAMNet TFLite الرسمية بالترتيب المتوقَّع: [scores, embeddings, spectrogram].
+  // لكن بعض إصدارات react-native-fast-tflite قد تُرجع المخرجات بترتيب مختلف
+  // أو تُخفي بعضها، فلا يصح الاعتماد على outputs[1] كمؤشر ثابت دائمًا.
+  let embeddingsFlat = null;
+
+  // المحاولة 1: الترتيب الرسمي (outputs[1])
+  if (outputs && outputs[1] && outputs[1].length % EMBED_DIM === 0 && outputs[1].length > 0) {
+    embeddingsFlat = outputs[1];
+  }
+
+  // المحاولة 2: ابحث بين كل المخرجات عن أول tensor طوله مضاعف لـ 1024
+  // — هذا بالضرورة tensor الـ embeddings، بغض النظر عن ترتيبه الفعلي.
+  if (!embeddingsFlat && outputs) {
+    for (let i = 0; i < outputs.length; i++) {
+      const t = outputs[i];
+      if (t && typeof t.length === 'number' && t.length > 0 && t.length % EMBED_DIM === 0) {
+        embeddingsFlat = t;
+        break;
+      }
+    }
+  }
+
+  // المحاولة 3: فشل كل شيء → رسالة خطأ تفصيلية تُظهر أحجام كل المخرجات
+  // لتسهيل التشخيص لاحقًا بدل رسالة "length of undefined" المبهمة.
+  if (!embeddingsFlat) {
+    const shapesInfo = outputs
+      ? outputs.map((t, i) => `outputs[${i}]: ${t ? t.length : 'undefined'}`).join(', ')
+      : 'outputs غير معرَّفة بالكامل';
+    throw new Error(
+      `تعذّر تحديد tensor الـ embeddings من مخرجات النموذج. الأحجام المُرجَعة: ${shapesInfo}. ` +
+      `تأكد أن ملف yamnet.tflite هو النسخة الصحيحة (classification variant, 3 outputs).`
+    );
+  }
+
   const numFrames = Math.floor(embeddingsFlat.length / EMBED_DIM);
 
   if (numFrames <= 0) {
