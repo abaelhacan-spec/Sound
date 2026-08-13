@@ -230,3 +230,134 @@ export function cosineSimilarity(vectorA, vectorB) {
   if (normA === 0 || normB === 0) return 0;
   return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
 }
+
+/**
+ * ═══ Pulse / Event Detection ══════════════════════════════════════════════
+ *
+ * لماذا هذه الدالة موجودة:
+ * قرار "هل هذا طرق على الباب؟" في المشروع كان يعتمد سابقًا فقط على تشابه
+ * embedding كامل للمقطع (YAMNet + cosine similarity)، بنفس آلية ALARM
+ * تمامًا. هذا لا يفرّق بين "نمط صعود-تخميد متكرر" (وهو ما يميّز الطرق
+ * فيزيائيًا) وبين أي صوت آخر له طاقة كلية مشابهة بالصدفة (كلام، موسيقى،
+ * ضجيج مستمر). computeRMS() تحسب طاقة إجمالية لكل المقطع فقط ولا تكشف
+ * هذا النمط الزمني الداخلي إطلاقًا.
+ *
+ * هذه الدالة تحلّل البنية الزمنية الداخلية للمقطع وتكتشف "نبضات" حقيقية:
+ * ذروات طاقة حادة الصعود تتجاوز خلفية الضجيج المحيطة بها بشكل ملحوظ.
+ *
+ * مهم: هذه الدالة *لا تحل محل* تشابه YAMNet — سقوط جسم مثلاً ينتج أيضًا
+ * نبضة مفردة حادة، لذلك يجب أن يبقى القرار النهائي للطرق مبنيًا على
+ * *الشرطين معًا*: (1) عدد النبضات ضمن مدى معقول و(2) تشابه embedding
+ * كافٍ مع العينات المرجعية. هذه الدالة طبقة تصفية إضافية تقلل
+ * False Positives، وليست مصنّفًا مستقلاً.
+ *
+ * @param {number[]} samples عينات صوتية مطبّعة بين -1 و1 (16kHz، مونو)
+ * @param {number} sampleRate معدل العينات (افتراضي 16000)
+ * @param {object} opts معاملات قابلة للمعايرة (انظر AI Calibration Lab)
+ * @returns {{
+ *   pulseCount: number,
+ *   pulses: Array<{ windowIndex: number, timeMs: number, peakRms: number, sharpness: number }>,
+ *   noiseFloor: number,
+ *   dynamicThreshold: number,
+ * }}
+ */
+const PULSE_WINDOW_MS = 20;
+const PULSE_HOP_MS = 10;
+
+/**
+ * يحسب RMS محلي لكل نافذة صغيرة متتالية (envelope) — الخطوة الأولى
+ * والوحيدة المكلفة حسابيًا في detectPulses(). مفصولة كدالة مستقلة كي
+ * تُحسَب مرة واحدة فقط لكل عينة صوتية في Calibration Lab، بينما يُعاد
+ * حساب كشف الذروات (رخيص جدًا) عشرات المرات أثناء Local Optimization
+ * لتجربة قيم معاملات مختلفة دون إعادة معالجة الصوت الخام في كل مرة.
+ */
+export function computeEnvelope(samples, sampleRate = 16000, windowMs = PULSE_WINDOW_MS, hopMs = PULSE_HOP_MS) {
+  const windowSize = Math.round((windowMs / 1000) * sampleRate);
+  const hopSize = Math.round((hopMs / 1000) * sampleRate);
+  const envelope = [];
+  if (!samples || samples.length < windowSize) return envelope;
+  for (let start = 0; start + windowSize <= samples.length; start += hopSize) {
+    let sumSquares = 0;
+    for (let i = start; i < start + windowSize; i++) {
+      sumSquares += samples[i] * samples[i];
+    }
+    envelope.push(Math.sqrt(sumSquares / windowSize));
+  }
+  return envelope;
+}
+
+/**
+ * الجزء الرخيص من detectPulses(): يعمل مباشرة على envelope جاهز (بدل
+ * إعادة حسابه من الصوت الخام). هذا ما يسمح لـ Local Optimization بتجربة
+ * عشرات configurations لمعاملات النبضات بسرعة على نفس Dataset.
+ */
+export function detectPulsesFromEnvelope(envelope, hopMs = PULSE_HOP_MS, opts = {}) {
+  const {
+    noiseFloorPercentile = 0.3,
+    energyRatioThreshold = 3.0,
+    minAbsRms = 0.008,
+    attackLookbackWindows = 4,
+    minPulseGapMs = 60,
+  } = opts;
+
+  if (!envelope || envelope.length === 0) {
+    return { pulseCount: 0, pulses: [], noiseFloor: 0, dynamicThreshold: 0 };
+  }
+
+  const sorted = [...envelope].sort((a, b) => a - b);
+  const floorIdx = Math.max(0, Math.floor(sorted.length * noiseFloorPercentile) - 1);
+  const noiseFloor = Math.max(sorted[floorIdx], 1e-6);
+
+  const dynamicThreshold = Math.max(noiseFloor * energyRatioThreshold, minAbsRms);
+  const candidateIdx = [];
+  for (let i = 0; i < envelope.length; i++) {
+    if (envelope[i] >= dynamicThreshold) candidateIdx.push(i);
+  }
+
+  const minGapWindows = Math.max(1, Math.round(minPulseGapMs / hopMs));
+  const pulses = [];
+  let clusterStart = null;
+  let clusterPeakIdx = null;
+  let clusterPeakVal = -1;
+  let lastIdx = -Infinity;
+
+  function closeCluster() {
+    if (clusterPeakIdx === null) return;
+    const lookback = Math.max(0, clusterPeakIdx - attackLookbackWindows);
+    const preEnergy = Math.max(envelope[lookback], 1e-6);
+    pulses.push({
+      windowIndex: clusterPeakIdx,
+      timeMs: Math.round(clusterPeakIdx * hopMs),
+      peakRms: clusterPeakVal,
+      sharpness: clusterPeakVal / preEnergy,
+    });
+    clusterStart = null;
+    clusterPeakIdx = null;
+    clusterPeakVal = -1;
+  }
+
+  for (const idx of candidateIdx) {
+    if (clusterStart !== null && idx - lastIdx > minGapWindows) {
+      closeCluster();
+    }
+    if (clusterStart === null) clusterStart = idx;
+    if (envelope[idx] > clusterPeakVal) {
+      clusterPeakVal = envelope[idx];
+      clusterPeakIdx = idx;
+    }
+    lastIdx = idx;
+  }
+  closeCluster();
+
+  return { pulseCount: pulses.length, pulses, noiseFloor, dynamicThreshold };
+}
+
+/**
+ * الواجهة الكاملة (تُستخدم في المسار الحي أثناء المراقبة والمعايرة): تحسب
+ * envelope من الصوت الخام ثم تكشف النبضات مباشرة. انظر الشرح الكامل أعلى
+ * الملف حول سبب وجود هذه الطبقة والحاجة لدمجها مع تشابه YAMNet.
+ */
+export function detectPulses(samples, sampleRate = 16000, opts = {}) {
+  const envelope = computeEnvelope(samples, sampleRate, PULSE_WINDOW_MS, PULSE_HOP_MS);
+  return detectPulsesFromEnvelope(envelope, PULSE_HOP_MS, opts);
+}
