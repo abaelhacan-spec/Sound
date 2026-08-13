@@ -4,6 +4,7 @@ import { View, ActivityIndicator, StyleSheet } from 'react-native';
 import CalibrationScreen from './screens/CalibrationScreen';
 import MonitoringScreen from './screens/MonitoringScreen';
 import DiagnosticScreen from './screens/DiagnosticScreen';
+import AICalibrationLabScreen from './screens/AICalibrationLabScreen';
 import {
   loadAlarmReferenceEmbeddings,
   loadKnockReferenceEmbeddings,
@@ -13,8 +14,8 @@ import {
 
 export default function App() {
   const [isLoading, setIsLoading] = useState(true);
-  // أضفنا 'diagnostic' كشاشة ثالثة — يمكن الوصول إليها من شاشة المعايرة
-  const [currentScreen, setCurrentScreen] = useState('calibration'); // 'calibration' | 'monitoring' | 'diagnostic'
+  // أضفنا 'diagnostic' و'aiCalibrationLab' كشاشتين إضافيتين — يمكن الوصول إليهما من شاشة المعايرة
+  const [currentScreen, setCurrentScreen] = useState('calibration'); // 'calibration' | 'monitoring' | 'diagnostic' | 'aiCalibrationLab'
 
   useEffect(() => {
     checkExistingSetup();
@@ -54,9 +55,12 @@ export default function App() {
         <CalibrationScreen
           onCalibrationComplete={() => setCurrentScreen('monitoring')}
           onOpenDiagnostic={() => setCurrentScreen('diagnostic')}
+          onOpenAiCalibrationLab={() => setCurrentScreen('aiCalibrationLab')}
         />
       ) : currentScreen === 'monitoring' ? (
         <MonitoringScreen onBackToSettings={() => setCurrentScreen('calibration')} />
+      ) : currentScreen === 'aiCalibrationLab' ? (
+        <AICalibrationLabScreen onBack={() => setCurrentScreen('calibration')} />
       ) : (
         <DiagnosticScreen onBack={() => setCurrentScreen('calibration')} />
       )}
