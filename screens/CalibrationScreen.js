@@ -17,7 +17,7 @@ import {
   requestAudioPermission,
   configureAudioMode,
 } from '../utils/audioRecorder';
-import { readWavAsSamples, computeRMS } from '../utils/audioFingerprint';
+import { readWavAsSamples, computeRMS, detectPulses } from '../utils/audioFingerprint';
 import { loadEmbeddingModel, extractEmbedding } from '../utils/embeddingModel';
 import {
   saveAlarmReferenceEmbeddings,
@@ -27,6 +27,7 @@ import {
   saveDetectionPaths,
   saveSimilarityThreshold,
   loadSimilarityThreshold,
+  loadKnockPulseConfig,
 } from '../utils/storage';
 
 // عدد العينات الأدنى المطلوب لكل صوت. كل عينة تُحوَّل إلى Embedding واحد
@@ -41,7 +42,7 @@ const THRESHOLD_STEP = 0.05;
 const THRESHOLD_MIN = 0.5;
 const THRESHOLD_MAX = 0.95;
 
-export default function CalibrationScreen({ onCalibrationComplete, onOpenDiagnostic }) {
+export default function CalibrationScreen({ onCalibrationComplete, onOpenDiagnostic, onOpenAiCalibrationLab }) {
   const [phoneNumber, setPhoneNumber] = useState('');
   const [alarmDetectionEnabled, setAlarmDetectionEnabled] = useState(true);
   const [knockDetectionEnabled, setKnockDetectionEnabled] = useState(true);
@@ -59,7 +60,8 @@ export default function CalibrationScreen({ onCalibrationComplete, onOpenDiagnos
   // ── حالة معايرة طرق الباب ──
   const [isRecordingKnock, setIsRecordingKnock] = useState(false);
   const [collectedKnockEmbeddings, setCollectedKnockEmbeddings] = useState([]);
-  const [pendingKnockSample, setPendingKnockSample] = useState(null); // { uri, embedding, rms }
+  const [pendingKnockSample, setPendingKnockSample] = useState(null); // { uri, embedding, rms, pulseInfo }
+  const knockPulseConfigRef = useRef(null);
 
   const [status, setStatus] = useState(
     'أدخل رقم الهاتف، ثم اضغط "تسجيل عينة" أثناء تشغيل صوت المنبه بجانب الهاتف'
@@ -82,6 +84,9 @@ export default function CalibrationScreen({ onCalibrationComplete, onOpenDiagnos
     });
     loadSimilarityThreshold().then((saved) => {
       if (typeof saved === 'number' && !Number.isNaN(saved)) setSimilarityThreshold(saved);
+    });
+    loadKnockPulseConfig().then((cfg) => {
+      knockPulseConfigRef.current = cfg;
     });
   }, []);
 
@@ -246,11 +251,22 @@ export default function CalibrationScreen({ onCalibrationComplete, onOpenDiagnos
       }
       const rms = computeRMS(samples);
 
+      // فحص نمط النبضات الزمنية (نفس الطبقة المستخدمة أثناء المراقبة الفعلية)
+      // لإظهار قياس حقيقي للمستخدم قبل اعتماد العينة كمرجع لاحقًا
+      const cfg = knockPulseConfigRef.current;
+      const pulseInfo = cfg
+        ? detectPulses(samples, 16000, {
+            energyRatioThreshold: cfg.energyRatioThreshold,
+            minAbsRms: cfg.minAbsRms,
+            minPulseGapMs: cfg.minPulseGapMs,
+          })
+        : null;
+
       step = 'استخراج البصمة عبر YAMNet';
       setStatus('🧠 جاري استخراج البصمة الصوتية...');
       const embedding = await extractEmbedding(samples, model);
 
-      setPendingKnockSample({ uri, embedding, rms });
+      setPendingKnockSample({ uri, embedding, rms, pulseInfo });
       setStatus('🎧 استمع للعينة وتأكد أنها التقطت الطرقة بوضوح، ثم اعتمدها أو أعد التسجيل');
     } catch (err) {
       Alert.alert('خطأ في خطوة: ' + step, err?.message || String(err));
@@ -529,6 +545,22 @@ export default function CalibrationScreen({ onCalibrationComplete, onOpenDiagnos
                   : '✅ مستوى الصوت جيد'}
               </Text>
 
+              {pendingKnockSample.pulseInfo && (
+                <Text
+                  style={[
+                    styles.reviewQuality,
+                    pendingKnockSample.pulseInfo.pulseCount >= 1 &&
+                    pendingKnockSample.pulseInfo.pulseCount <= (knockPulseConfigRef.current?.maxPulses ?? 6)
+                      ? styles.reviewQualityGood
+                      : styles.reviewQualityWeak,
+                  ]}
+                >
+                  📊 عدد النبضات المكتشفة: {pendingKnockSample.pulseInfo.pulseCount}
+                  {pendingKnockSample.pulseInfo.pulseCount === 0 &&
+                    ' — لم تُكتشف أي نبضة حادة، جرّب طرقًا أوضح'}
+                </Text>
+              )}
+
               <TouchableOpacity style={styles.playButton} onPress={handlePlayPendingKnock}>
                 <Text style={styles.buttonText}>
                   {isPlaying ? '⏸️ جاري التشغيل...' : '▶️ استماع للعينة'}
@@ -563,6 +595,12 @@ export default function CalibrationScreen({ onCalibrationComplete, onOpenDiagnos
       {onOpenDiagnostic && (
         <TouchableOpacity style={styles.diagnosticButton} onPress={onOpenDiagnostic}>
           <Text style={styles.diagnosticButtonText}>🔬 فحص النموذج (تشخيص)</Text>
+        </TouchableOpacity>
+      )}
+
+      {onOpenAiCalibrationLab && (
+        <TouchableOpacity style={styles.diagnosticButton} onPress={onOpenAiCalibrationLab}>
+          <Text style={styles.diagnosticButtonText}>🧪 AI Calibration Lab</Text>
         </TouchableOpacity>
       )}
     </ScrollView>

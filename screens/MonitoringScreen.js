@@ -8,7 +8,7 @@ import {
   requestAudioPermission,
   configureAudioMode,
 } from '../utils/audioRecorder';
-import { readWavAsSamples, computeRMS, cosineSimilarity } from '../utils/audioFingerprint';
+import { readWavAsSamples, computeRMS, cosineSimilarity, detectPulses } from '../utils/audioFingerprint';
 import { loadEmbeddingModel, extractEmbedding } from '../utils/embeddingModel';
 import {
   loadAlarmReferenceEmbeddings,
@@ -16,12 +16,14 @@ import {
   loadPhoneNumber,
   loadDetectionPaths,
   saveDetectionPaths,
-  loadSimilarityThreshold,
+  loadAlarmSimilarityThreshold,
+  loadKnockSimilarityThreshold,
+  loadEnergyGateRms,
+  loadKnockPulseConfig,
 } from '../utils/storage';
 
 const COOLDOWN_MS = 30000; // مهلة قبل السماح باتصال جديد بعد الاتصال السابق
 const CHUNK_DURATION_MS = 2000; // نفس مدة تسجيل عينات المعايرة
-const MIN_ENERGY_RMS = 0.015; // بوابة طاقة رخيصة الحساب: أي مقطع أهدأ من هذا يُعتبر صمت ولا يُشغَّل عليه النموذج إطلاقًا (توفير بطارية)
 
 // مرحلة التحقق النهائي: بعد تجاوز عتبة التشابه، نسجّل مقطعًا قصيرًا إضافيًا
 // ونعيد فحصه قبل الاتصال فعليًا، لالتقاط الحالات النادرة (كصدى أو انعكاس
@@ -53,7 +55,10 @@ export default function MonitoringScreen({ onBackToSettings }) {
   const isMonitoringRef = useRef(false);
   const alarmEmbeddingsRef = useRef(null);
   const knockEmbeddingsRef = useRef(null);
-  const thresholdRef = useRef(0.75);
+  const alarmThresholdRef = useRef(0.75);
+  const knockThresholdRef = useRef(0.75);
+  const energyGateRef = useRef(0.015);
+  const knockPulseConfigRef = useRef(null);
   const lastCallTimeRef = useRef(0);
   const phoneNumberRef = useRef('');
   const knockEnabledRef = useRef(true);
@@ -75,7 +80,10 @@ export default function MonitoringScreen({ onBackToSettings }) {
     const alarmEmbeddings = await loadAlarmReferenceEmbeddings();
     const knockEmbeddings = await loadKnockReferenceEmbeddings();
     const phone = await loadPhoneNumber();
-    const threshold = await loadSimilarityThreshold();
+    const alarmThreshold = await loadAlarmSimilarityThreshold();
+    const knockThreshold = await loadKnockSimilarityThreshold();
+    const energyGate = await loadEnergyGateRms();
+    const knockPulseConfig = await loadKnockPulseConfig();
 
     if (alarmDetectionEnabled && (!alarmEmbeddings || alarmEmbeddings.length === 0)) {
       Alert.alert('إعداد ناقص', 'لازم تعمل معايرة لصوت المنبه أولًا، أو عطّل مسار المنبه من هذه الشاشة');
@@ -105,7 +113,10 @@ export default function MonitoringScreen({ onBackToSettings }) {
 
     alarmEmbeddingsRef.current = alarmEmbeddings;
     knockEmbeddingsRef.current = knockEmbeddings;
-    thresholdRef.current = threshold;
+    alarmThresholdRef.current = alarmThreshold;
+    knockThresholdRef.current = knockThreshold;
+    energyGateRef.current = energyGate;
+    knockPulseConfigRef.current = knockPulseConfig;
     phoneNumberRef.current = phone;
     knockEnabledRef.current = knockDetectionEnabled;
     alarmEnabledRef.current = alarmDetectionEnabled;
@@ -130,18 +141,39 @@ export default function MonitoringScreen({ onBackToSettings }) {
     setStatus('تم إيقاف المراقبة');
   }
 
+  /**
+   * يفحص أن نمط النبضات الزمنية في مقطع صوتي يطابق ما يُتوقَّع من طرقة
+   * حقيقية (عدد نبضات ضمن مدى معقول + حدة صعود كافية لنبضة واحدة على
+   * الأقل). هذه طبقة تصفية إضافية تعمل *جنبًا إلى جنب* مع تشابه YAMNet،
+   * وليست بديلاً عنه — انظر شرح detectPulses() في audioFingerprint.js.
+   */
+  function isKnockPulsePatternValid(samples) {
+    const cfg = knockPulseConfigRef.current;
+    if (!cfg) return true; // احتياطي: لو لم تُحمَّل الإعدادات بعد لأي سبب
+    const { pulseCount, pulses } = detectPulses(samples, 16000, {
+      energyRatioThreshold: cfg.energyRatioThreshold,
+      minAbsRms: cfg.minAbsRms,
+      minPulseGapMs: cfg.minPulseGapMs,
+    });
+    if (pulseCount < cfg.minPulses || pulseCount > cfg.maxPulses) return false;
+    return pulses.some((p) => p.sharpness >= cfg.minAttackSharpness);
+  }
+
   /** يسجّل مقطعًا إضافيًا قصيرًا ويعيد فحص التشابه ضد نفس مجموعة العينات المرجعية، قبل الاتصال فعليًا */
-  async function runFinalConfirmation(referenceEmbeddings) {
+  async function runFinalConfirmation(referenceEmbeddings, source) {
     const uri = await recordChunk(CONFIRM_CHUNK_MS);
     const samples = await readWavAsSamples(uri);
     await deleteTempFile(uri);
 
     const energy = computeRMS(samples);
-    if (energy < MIN_ENERGY_RMS) return false;
+    if (energy < energyGateRef.current) return false;
+
+    if (source === 'knock' && !isKnockPulsePatternValid(samples)) return false;
 
     const embedding = await extractEmbedding(samples, modelRef.current);
     const sim = maxSimilarity(embedding, referenceEmbeddings);
-    return sim >= thresholdRef.current;
+    const threshold = source === 'knock' ? knockThresholdRef.current : alarmThresholdRef.current;
+    return sim >= threshold;
   }
 
   async function monitoringLoop() {
@@ -159,10 +191,13 @@ export default function MonitoringScreen({ onBackToSettings }) {
         const energy = computeRMS(samples);
 
         // بوابة الطاقة: صمت أو ضوضاء خافتة جدًا لا تستحق تشغيل النموذج إطلاقًا
-        if (energy < MIN_ENERGY_RMS) {
+        if (energy < energyGateRef.current) {
           if (isMonitoringRef.current) setStatus('🟢 المراقبة شغالة... (صمت)');
           continue;
         }
+
+        // فحص نمط النبضات لـ Knock مبكرًا (رخيص حسابيًا، لا يحتاج YAMNet)
+        const knockPulseOk = knockEnabledRef.current ? isKnockPulsePatternValid(samples) : false;
 
         const embedding = await extractEmbedding(samples, modelRef.current);
 
@@ -177,12 +212,13 @@ export default function MonitoringScreen({ onBackToSettings }) {
           setLastKnockSimilarity(knockSim);
         }
 
-        const alarmPassed = alarmEnabledRef.current && alarmSim >= thresholdRef.current;
-        const knockPassed = knockEnabledRef.current && knockSim >= thresholdRef.current;
+        const alarmPassed = alarmEnabledRef.current && alarmSim >= alarmThresholdRef.current;
+        // Knock يتطلب الشرطين معًا: تشابه embedding كافٍ + نمط نبضات صحيح
+        const knockPassed = knockEnabledRef.current && knockSim >= knockThresholdRef.current && knockPulseOk;
 
         if (knockPassed && knockSim >= alarmSim) {
           setStatus(`🚪 تطابق طرق محتمل (${(knockSim * 100).toFixed(0)}%) — جاري التحقق النهائي...`);
-          const confirmed = await runFinalConfirmation(knockEmbeddingsRef.current);
+          const confirmed = await runFinalConfirmation(knockEmbeddingsRef.current, 'knock');
           const now = Date.now();
           if (confirmed) {
             if (now - lastCallTimeRef.current > COOLDOWN_MS) {
@@ -195,7 +231,7 @@ export default function MonitoringScreen({ onBackToSettings }) {
           }
         } else if (alarmPassed) {
           setStatus(`🟡 تطابق منبه محتمل (${(alarmSim * 100).toFixed(0)}%) — جاري التحقق النهائي...`);
-          const confirmed = await runFinalConfirmation(alarmEmbeddingsRef.current);
+          const confirmed = await runFinalConfirmation(alarmEmbeddingsRef.current, 'alarm');
           const now = Date.now();
           if (confirmed) {
             if (now - lastCallTimeRef.current > COOLDOWN_MS) {
