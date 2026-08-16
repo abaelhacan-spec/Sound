@@ -253,10 +253,15 @@ export default function AICalibrationLabScreen({ onBack }) {
     setStatus('⚙️ جاري تشغيل Local Optimization (بحث شبكي محلي بلا إنترنت)...');
     try {
       const full = buildFullDataset();
-      const { calibrationSet, validationSet } = splitDataset(full, 0.7);
+      const splitResult = splitDataset(full, 0.7);
+      // Defensive check: لو splitDataset لأي سبب لم تُرجع الشكل المتوقَّع
+      if (!splitResult || !Array.isArray(splitResult.calibrationSet) || !Array.isArray(splitResult.validationSet)) {
+        throw new Error('splitDataset لم تُرجع calibrationSet/validationSet بالشكل المتوقَّع');
+      }
+      const { calibrationSet, validationSet } = splitResult;
       validationSetRef.current = validationSet;
 
-      const { results, metRecallFloor: floorMet } = runLocalGridSearch(
+      const gridSearchOutput = runLocalGridSearch(
         calibrationSet,
         productionRefs.alarm,
         productionRefs.knock,
@@ -264,7 +269,29 @@ export default function AICalibrationLabScreen({ onBack }) {
         10,
         MIN_RECALL_FLOOR
       );
+      // Defensive check: runLocalGridSearch يجب أن تُرجع دائمًا { results, metRecallFloor }
+      // — هذا الفحص يحوّل أي خلل توافق مستقبلي إلى رسالة خطأ واضحة بدل
+      // انهيار محرك JS المبهم "Cannot convert undefined value to object"
+      // الذي يحدث عند محاولة destructuring نتيجة undefined.
+      if (!gridSearchOutput || !Array.isArray(gridSearchOutput.results)) {
+        throw new Error('runLocalGridSearch لم تُرجع { results, metRecallFloor } كما هو متوقَّع — تحقق من توافق نسخة calibrationEngine.js');
+      }
+      const { results, metRecallFloor: floorMet } = gridSearchOutput;
+
+      if (results.length === 0) {
+        setTopConfigs([]);
+        setCalibrationEvalResult(null);
+        setValidationEvalResult(null);
+        setOverfitting(null);
+        setMetRecallFloor(false);
+        setStatus('⚠️ لم يُنتِج البحث الشبكي أي configuration قابلة للتقييم. تحقّق من أن Dataset يحتوي فعليًا على عينات alarm/knock/other صالحة.');
+        return;
+      }
+
       const best = results[0];
+      if (!best || !best.config) {
+        throw new Error('أفضل configuration المُعادة من runLocalGridSearch لا تحتوي على config صالح');
+      }
 
       const validationResult = evaluateConfig(validationSet, productionRefs.alarm, productionRefs.knock, best.config);
       const overfit = checkOverfitting(best, validationResult);
@@ -286,6 +313,7 @@ export default function AICalibrationLabScreen({ onBack }) {
       }
     } catch (err) {
       Alert.alert('خطأ', 'فشل Local Optimization: ' + err.message);
+      setStatus('❌ فشل Local Optimization: ' + err.message);
     } finally {
       setIsOptimizing(false);
     }
