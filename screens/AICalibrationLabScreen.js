@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useMemo } from 'react';
 import {
   View,
   Text,
@@ -41,18 +41,66 @@ import {
   runLocalGridSearch,
   checkOverfitting,
   buildGeminiDatasetSummary,
+  computeRawFeatureDiagnostics,
 } from '../utils/calibrationEngine';
 
 // ─── أهداف حجم Dataset لكل فئة (بند 4 من المواصفة) ─────────────────────────
 const DATASET_TARGETS = { alarm: 20, knock: 20, other: 30 };
 const MIN_USABLE = { alarm: 10, knock: 10, other: 15 }; // حد أدنى للسماح بتشغيل Local Optimization حتى قبل بلوغ الهدف الكامل
 const CHUNK_MS = 2000; // نفس مدة تسجيل عينات المعايرة العادية والمراقبة الحية — نفس الـ pipeline تمامًا
+const MIN_RECALL_FLOOR = 0.5; // الحد الأدنى المقبول للـ Recall لـ alarm وknock (قابل للتعديل من واجهة المستخدم لاحقًا)
+const MIN_ADOPTABLE_F1 = 0.5; // زر "اعتماد" يُعطَّل تلقائيًا تحت هذا الحد
 
 const LABELS = {
   alarm: { title: '🔔 ALARM', hint: 'صوت منبه حقيقي — بمسافات وشدّات وأوضاع هاتف مختلفة' },
   knock: { title: '🚪 KNOCK', hint: 'طرقات باب حقيقية — ضعيفة وقوية ومتعددة وبسرعات مختلفة' },
   other: { title: '🌫️ OTHER', hint: 'بيئة حقيقية: صمت، ضجيج رواق، كلام، خطوات، إغلاق أبواب، سقوط أشياء...' },
 };
+
+/** يُنسّق رقمًا للعرض التشخيصي فقط — لا علاقة له بأي منطق قرار. null/undefined → '—' */
+function fmtNum(value, decimals = 2) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return '—';
+  return value.toFixed(decimals);
+}
+
+/** صف واحد من إحصائيات Raw لميزة واحدة (alarmSim/knockSim/pulseCount) — عرض فقط */
+function RawStatsRow({ name, stats }) {
+  const decimals = name === 'pulseCount' ? 0 : 2;
+  if (!stats || stats.count === 0) {
+    return (
+      <View style={styles.diagStatsRow}>
+        <Text style={styles.diagFeatureName}>{name}</Text>
+        <Text style={styles.hint}>لا توجد قيم صالحة (N={stats?.count ?? 0}, invalid={stats?.invalidCount ?? 0})</Text>
+      </View>
+    );
+  }
+  return (
+    <View style={styles.diagStatsRow}>
+      <Text style={styles.diagFeatureName}>
+        {name} (N={stats.count}{stats.invalidCount > 0 ? `, invalid=${stats.invalidCount}` : ''})
+      </Text>
+      <ScrollView horizontal showsHorizontalScrollIndicator={true}>
+        <View style={styles.diagStatsValuesRow}>
+          {[
+            ['Min', stats.min],
+            ['P10', stats.p10],
+            ['P25', stats.p25],
+            ['Median', stats.median],
+            ['P75', stats.p75],
+            ['P90', stats.p90],
+            ['Max', stats.max],
+            ['Mean', stats.mean],
+          ].map(([label, value]) => (
+            <View key={label} style={styles.diagStatCell}>
+              <Text style={styles.diagStatCellLabel}>{label}</Text>
+              <Text style={styles.diagStatCellValue}>{fmtNum(value, decimals)}</Text>
+            </View>
+          ))}
+        </View>
+      </ScrollView>
+    </View>
+  );
+}
 
 export default function AICalibrationLabScreen({ onBack }) {
   // ── Gemini API Configuration ──────────────────────────────────────────
@@ -72,10 +120,12 @@ export default function AICalibrationLabScreen({ onBack }) {
 
   // ── Local Optimization ────────────────────────────────────────────────
   const [isOptimizing, setIsOptimizing] = useState(false);
-  const [gridResults, setGridResults] = useState(null); // top N
-  const [calibrationEvalResult, setCalibrationEvalResult] = useState(null);
+  const [topConfigs, setTopConfigs] = useState(null); // Top N بعد الفلترة (لجدول المقارنة)
+  const [calibrationEvalResult, setCalibrationEvalResult] = useState(null); // أفضل واحدة (topConfigs[0])
   const [validationEvalResult, setValidationEvalResult] = useState(null);
   const [overfitting, setOverfitting] = useState(null);
+  const [metRecallFloor, setMetRecallFloor] = useState(true);
+  const validationSetRef = useRef([]); // يُحفظ من آخر تشغيل لـ Local Optimization لاستخدامه في جدول Top 5
 
   // ── Gemini Analysis ────────────────────────────────────────────────────
   const [isConsultingGemini, setIsConsultingGemini] = useState(false);
@@ -85,6 +135,9 @@ export default function AICalibrationLabScreen({ onBack }) {
   const [retestResult, setRetestResult] = useState(null); // { before, after }
 
   const [status, setStatus] = useState('ابدأ بجمع عينات ALARM وKNOCK وOTHER الحقيقية من بيئتك.');
+
+  // ── Raw Dataset Diagnostics (تشخيصي بحت — لا يؤثر على أي قرار تصنيف) ──
+  const [diagnosticsExpanded, setDiagnosticsExpanded] = useState(false);
 
   useEffect(() => {
     (async () => {
@@ -249,26 +302,67 @@ export default function AICalibrationLabScreen({ onBack }) {
     setStatus('⚙️ جاري تشغيل Local Optimization (بحث شبكي محلي بلا إنترنت)...');
     try {
       const full = buildFullDataset();
-      const { calibrationSet, validationSet } = splitDataset(full, 0.7);
+      const splitResult = splitDataset(full, 0.7);
+      // Defensive check: لو splitDataset لأي سبب لم تُرجع الشكل المتوقَّع
+      if (!splitResult || !Array.isArray(splitResult.calibrationSet) || !Array.isArray(splitResult.validationSet)) {
+        throw new Error('splitDataset لم تُرجع calibrationSet/validationSet بالشكل المتوقَّع');
+      }
+      const { calibrationSet, validationSet } = splitResult;
+      validationSetRef.current = validationSet;
 
-      const results = runLocalGridSearch(calibrationSet, productionRefs.alarm, productionRefs.knock, {}, 10);
+      const gridSearchOutput = runLocalGridSearch(
+        calibrationSet,
+        productionRefs.alarm,
+        productionRefs.knock,
+        {},
+        10,
+        MIN_RECALL_FLOOR
+      );
+      // Defensive check: runLocalGridSearch يجب أن تُرجع دائمًا { results, metRecallFloor }
+      // — هذا الفحص يحوّل أي خلل توافق مستقبلي إلى رسالة خطأ واضحة بدل
+      // انهيار محرك JS المبهم "Cannot convert undefined value to object"
+      // الذي يحدث عند محاولة destructuring نتيجة undefined.
+      if (!gridSearchOutput || !Array.isArray(gridSearchOutput.results)) {
+        throw new Error('runLocalGridSearch لم تُرجع { results, metRecallFloor } كما هو متوقَّع — تحقق من توافق نسخة calibrationEngine.js');
+      }
+      const { results, metRecallFloor: floorMet } = gridSearchOutput;
+
+      if (results.length === 0) {
+        setTopConfigs([]);
+        setCalibrationEvalResult(null);
+        setValidationEvalResult(null);
+        setOverfitting(null);
+        setMetRecallFloor(false);
+        setStatus('⚠️ لم يُنتِج البحث الشبكي أي configuration قابلة للتقييم. تحقّق من أن Dataset يحتوي فعليًا على عينات alarm/knock/other صالحة.');
+        return;
+      }
+
       const best = results[0];
+      if (!best || !best.config) {
+        throw new Error('أفضل configuration المُعادة من runLocalGridSearch لا تحتوي على config صالح');
+      }
 
       const validationResult = evaluateConfig(validationSet, productionRefs.alarm, productionRefs.knock, best.config);
       const overfit = checkOverfitting(best, validationResult);
 
-      setGridResults(results);
+      setTopConfigs(results);
       setCalibrationEvalResult(best);
       setValidationEvalResult(validationResult);
       setOverfitting(overfit);
+      setMetRecallFloor(floorMet);
 
-      setStatus(
-        overfit.isOverfitting
-          ? '⚠️ اكتمل البحث المحلي — لكن هناك مؤشر Possible Overfitting، راجع النتائج بعناية'
-          : '✅ اكتمل البحث المحلي — راجع أفضل configuration أدناه'
-      );
+      if (!floorMet) {
+        setStatus(
+          `⚠️ لم تنجح أي configuration في تحقيق حد أدنى Recall=${MIN_RECALL_FLOOR} لكل من ALARM وKNOCK. النتيجة المعروضة هي الأفضل المتاحة فقط — يُنصح بجمع عينات إيجابية أكثر أو تخفيف نطاق البحث بدل اعتمادها مباشرة.`
+        );
+      } else if (overfit.isOverfitting) {
+        setStatus('⚠️ اكتمل البحث المحلي — لكن هناك مؤشر Possible Overfitting، راجع النتائج بعناية');
+      } else {
+        setStatus('✅ اكتمل البحث المحلي — راجع الجدول والنتائج أدناه قبل الاعتماد');
+      }
     } catch (err) {
       Alert.alert('خطأ', 'فشل Local Optimization: ' + err.message);
+      setStatus('❌ فشل Local Optimization: ' + err.message);
     } finally {
       setIsOptimizing(false);
     }
@@ -294,10 +388,11 @@ export default function AICalibrationLabScreen({ onBack }) {
     try {
       const summary = buildGeminiDatasetSummary({
         dataset: buildFullDataset(),
-        gridResults,
+        gridResults: topConfigs,
         calibrationResult: calibrationEvalResult,
         validationResult: validationEvalResult,
         overfitting,
+        metRecallFloor,
       });
       const analysis = await requestGeminiCalibrationAnalysis(key, summary);
       setGeminiRecommendations(analysis.recommendations.map((r) => ({ ...r, decision: null })));
@@ -422,6 +517,23 @@ export default function AICalibrationLabScreen({ onBack }) {
   // ═══ العرض ═══════════════════════════════════════════════════════════
   // ═══════════════════════════════════════════════════════════════════════
 
+  // ── Raw Dataset Diagnostics: قراءة/تلخيص فقط — لا تُستخدم في أي قرار.
+  //    تُحسَب من نفس dataset ونفس productionRefs المستخدمَين في Local
+  //    Optimization، وبنفس معاملات استخراج pulseCount الحالية المحفوظة
+  //    (currentConfig.knock)، دون تطبيق أي threshold أو energyGate عليها. ──
+  const rawDiagnostics = useMemo(() => {
+    const fullDataset = [...dataset.alarm, ...dataset.knock, ...dataset.other];
+    if (fullDataset.length === 0) return null;
+    const pulseParams = currentConfig?.knock
+      ? {
+          energyRatioThreshold: currentConfig.knock.energyRatioThreshold,
+          minAbsRms: currentConfig.knock.minAbsRms,
+          minPulseGapMs: currentConfig.knock.minPulseGapMs,
+        }
+      : {};
+    return computeRawFeatureDiagnostics(fullDataset, productionRefs.alarm || [], productionRefs.knock || [], pulseParams);
+  }, [dataset, productionRefs, currentConfig]);
+
   const statusColors = {
     not_configured: '#888',
     testing: '#60a5fa',
@@ -512,35 +624,177 @@ export default function AICalibrationLabScreen({ onBack }) {
         </View>
       ))}
 
+      {/* ── Raw Dataset Diagnostics (تشخيصي بحت — لا يغيّر أي threshold أو قرار) ── */}
+      <View style={styles.section}>
+        <TouchableOpacity style={styles.diagnosticsHeader} onPress={() => setDiagnosticsExpanded((v) => !v)}>
+          <View>
+            <Text style={styles.sectionTitle}>🔬 Raw Dataset Diagnostics</Text>
+            <Text style={styles.hint}>Values before thresholds / gates</Text>
+          </View>
+          <Text style={styles.diagnosticsToggle}>{diagnosticsExpanded ? '▲' : '▼'}</Text>
+        </TouchableOpacity>
+
+        {diagnosticsExpanded && (
+          <>
+            {!rawDiagnostics ? (
+              <Text style={styles.hint}>لا توجد عينات مجمَّعة بعد — سجّل عينات ALARM/KNOCK/OTHER أولًا.</Text>
+            ) : (
+              <View style={styles.resultBox}>
+                <Text style={styles.resultTitle}>Samples</Text>
+                <Text style={styles.resultLine}>ALARM: {rawDiagnostics.sampleCounts.alarm}</Text>
+                <Text style={styles.resultLine}>KNOCK: {rawDiagnostics.sampleCounts.knock}</Text>
+                <Text style={styles.resultLine}>OTHER: {rawDiagnostics.sampleCounts.other}</Text>
+
+                <Text style={styles.resultSubtitle}>Raw Feature Range (كل العينات مجتمعة):</Text>
+                <Text style={styles.resultLine}>
+                  alarmSim: {fmtNum(rawDiagnostics.overallRange.alarmSim.min)} → {fmtNum(rawDiagnostics.overallRange.alarmSim.max)}
+                </Text>
+                <Text style={styles.resultLine}>
+                  knockSim: {fmtNum(rawDiagnostics.overallRange.knockSim.min)} → {fmtNum(rawDiagnostics.overallRange.knockSim.max)}
+                </Text>
+                <Text style={styles.resultLine}>
+                  pulseCount: {fmtNum(rawDiagnostics.overallRange.pulseCount.min, 0)} → {fmtNum(rawDiagnostics.overallRange.pulseCount.max, 0)}
+                </Text>
+
+                {['alarm', 'knock', 'other'].map((label) => (
+                  <View key={label} style={styles.diagnosticsLabelBlock}>
+                    <Text style={styles.resultSubtitle}>{label.toUpperCase()}</Text>
+                    {['alarmSim', 'knockSim', 'pulseCount'].map((feature) => (
+                      <RawStatsRow key={feature} name={feature} stats={rawDiagnostics.byLabel[label][feature]} />
+                    ))}
+                  </View>
+                ))}
+
+                <Text style={styles.resultSubtitle}>Invalid</Text>
+                <Text style={styles.resultLine}>alarmSim: {rawDiagnostics.invalidCounts.alarmSim}</Text>
+                <Text style={styles.resultLine}>knockSim: {rawDiagnostics.invalidCounts.knockSim}</Text>
+                <Text style={styles.resultLine}>pulseCount: {rawDiagnostics.invalidCounts.pulseCount}</Text>
+              </View>
+            )}
+          </>
+        )}
+      </View>
+
       {/* ── Local Optimization ── */}
       <View style={styles.section}>
         <Text style={styles.sectionTitle}>⚙️ Local Optimization</Text>
-        <Text style={styles.hint}>بحث شبكي محلي بلا إنترنت — يختبر configurations مختلفة على مراجعك المعتمدة حاليًا، مع وزن كبير لـ False Positives.</Text>
+        <Text style={styles.hint}>
+          بحث شبكي محلي بلا إنترنت — الهدف الأساسي هو أفضل توازن بين اكتشاف الأصوات الحقيقية ورفض الضوضاء (targetF1)،
+          وليس فقط تقليل False Positives. أي configuration يفشل تحت Recall={MIN_RECALL_FLOOR} لـ ALARM أو KNOCK يُستبعد تلقائيًا من الترتيب.
+        </Text>
         <TouchableOpacity style={styles.button} onPress={handleRunLocalOptimization} disabled={isOptimizing}>
           {isOptimizing ? <ActivityIndicator color="#fff" /> : <Text style={styles.buttonText}>▶️ تشغيل Local Optimization</Text>}
         </TouchableOpacity>
 
         {calibrationEvalResult && validationEvalResult && (
           <View style={styles.resultBox}>
+            {!metRecallFloor && (
+              <Text style={styles.warningText}>
+                ⚠️ لم تنجح أي configuration في تحقيق الحد الأدنى للـ Recall — هذه أفضل نتيجة متاحة فقط، وليست بالضرورة عملية.
+              </Text>
+            )}
+
             <Text style={styles.resultTitle}>أفضل Configuration (Calibration Set)</Text>
             <Text style={styles.resultLine}>ALARM threshold: {calibrationEvalResult.config.alarm.similarityThreshold}</Text>
             <Text style={styles.resultLine}>KNOCK threshold: {calibrationEvalResult.config.knock.similarityThreshold}</Text>
             <Text style={styles.resultLine}>Energy gate: {calibrationEvalResult.config.energyGate}</Text>
-            <Text style={styles.resultLine}>
-              FP: {calibrationEvalResult.totalFP} | FN: {calibrationEvalResult.totalFN} | F1: {calibrationEvalResult.f1.toFixed(2)}
-            </Text>
+
+            {/* ── Precision/Recall/F1 منفصلة لكل فئة (بدل FP/FN فقط) ── */}
+            <Text style={styles.resultSubtitle}>لكل فئة (Calibration Set):</Text>
+            {['alarm', 'knock', 'other'].map((c) => (
+              <Text style={styles.resultLine} key={c}>
+                {c.toUpperCase()} — P: {calibrationEvalResult.perClass[c].precision.toFixed(2)} | R:{' '}
+                {calibrationEvalResult.perClass[c].recall.toFixed(2)} | F1: {calibrationEvalResult.perClass[c].f1.toFixed(2)}
+              </Text>
+            ))}
+            <Text style={styles.resultLine}>Target F1 (alarm+knock): {calibrationEvalResult.targetF1.toFixed(2)}</Text>
+
+            {/* ── Confusion Matrix ── */}
+            <Text style={styles.resultSubtitle}>Confusion Matrix (الحقيقة → التنبؤ):</Text>
+            <View style={styles.matrixHeaderRow}>
+              <Text style={styles.matrixCellHeader}> </Text>
+              <Text style={styles.matrixCellHeader}>ALARM</Text>
+              <Text style={styles.matrixCellHeader}>KNOCK</Text>
+              <Text style={styles.matrixCellHeader}>OTHER</Text>
+            </View>
+            {['alarm', 'knock', 'other'].map((actual) => (
+              <View style={styles.matrixRow} key={actual}>
+                <Text style={styles.matrixCellLabel}>{actual.toUpperCase()}</Text>
+                {['alarm', 'knock', 'other'].map((pred) => (
+                  <Text
+                    key={pred}
+                    style={[styles.matrixCell, actual === pred && styles.matrixCellDiagonal]}
+                  >
+                    {calibrationEvalResult.confusion[actual][pred]}
+                  </Text>
+                ))}
+              </View>
+            ))}
+
             <Text style={styles.resultSubtitle}>على Validation Set (عينات لم تدخل التحسين):</Text>
             <Text style={styles.resultLine}>
-              FP: {validationEvalResult.totalFP} | FN: {validationEvalResult.totalFN} | F1: {validationEvalResult.f1.toFixed(2)}
+              Target F1: {validationEvalResult.targetF1.toFixed(2)} | FP: {validationEvalResult.totalFP} | FN:{' '}
+              {validationEvalResult.totalFN}
             </Text>
-            {overfitting?.isOverfitting && <Text style={styles.warningText}>⚠️ Possible Overfitting (فجوة F1: {overfitting.f1Gap.toFixed(2)})</Text>}
+            {overfitting?.isOverfitting && (
+              <Text style={styles.warningText}>⚠️ Possible Overfitting (فجوة Target F1: {overfitting.f1Gap.toFixed(2)})</Text>
+            )}
 
-            <TouchableOpacity
-              style={styles.acceptButton}
-              onPress={() => handleAdoptConfiguration(calibrationEvalResult.config, 'من Local Optimization مباشرة')}
-            >
-              <Text style={styles.buttonText}>✅ اعتماد هذا الإعداد</Text>
-            </TouchableOpacity>
+            {calibrationEvalResult.targetF1 < MIN_ADOPTABLE_F1 ||
+            calibrationEvalResult.perClass.alarm.recall === 0 ||
+            calibrationEvalResult.perClass.knock.recall === 0 ? (
+              <Text style={styles.warningText}>
+                🚫 زر الاعتماد معطَّل: Target F1 ({calibrationEvalResult.targetF1.toFixed(2)}) أقل من الحد الأدنى المقبول (
+                {MIN_ADOPTABLE_F1}), أو Recall لأحد الأصوات المستهدفة صفر. جرّب توسيع نطاق البحث أو جمع عينات أكثر.
+              </Text>
+            ) : (
+              <TouchableOpacity
+                style={styles.acceptButton}
+                onPress={() => handleAdoptConfiguration(calibrationEvalResult.config, 'من Local Optimization مباشرة')}
+              >
+                <Text style={styles.buttonText}>✅ اعتماد هذا الإعداد</Text>
+              </TouchableOpacity>
+            )}
+          </View>
+        )}
+
+        {/* ── جدول مقارنة Top 5 ── */}
+        {topConfigs && topConfigs.length > 0 && (
+          <View style={styles.resultBox}>
+            <Text style={styles.resultTitle}>مقارنة أفضل {Math.min(5, topConfigs.length)} Configurations</Text>
+            <ScrollView horizontal showsHorizontalScrollIndicator={true}>
+              <View>
+                <View style={styles.tableHeaderRow}>
+                  {['#', 'ALARM', 'KNOCK', 'Gate', 'Prec.', 'Recall', 'F1', 'FP', 'FN', 'ValF1'].map((h) => (
+                    <Text key={h} style={styles.tableHeaderCell}>
+                      {h}
+                    </Text>
+                  ))}
+                </View>
+                {topConfigs.slice(0, 5).map((r, idx) => {
+                  const valResult = evaluateConfig(
+                    validationSetRef.current,
+                    productionRefs.alarm || [],
+                    productionRefs.knock || [],
+                    r.config
+                  );
+                  return (
+                    <View style={styles.tableRow} key={idx}>
+                      <Text style={styles.tableCell}>{idx + 1}</Text>
+                      <Text style={styles.tableCell}>{r.config.alarm.similarityThreshold}</Text>
+                      <Text style={styles.tableCell}>{r.config.knock.similarityThreshold}</Text>
+                      <Text style={styles.tableCell}>{r.config.energyGate}</Text>
+                      <Text style={styles.tableCell}>{((r.perClass.alarm.precision + r.perClass.knock.precision) / 2).toFixed(2)}</Text>
+                      <Text style={styles.tableCell}>{((r.perClass.alarm.recall + r.perClass.knock.recall) / 2).toFixed(2)}</Text>
+                      <Text style={styles.tableCell}>{r.targetF1.toFixed(2)}</Text>
+                      <Text style={styles.tableCell}>{r.totalFP}</Text>
+                      <Text style={styles.tableCell}>{r.totalFN}</Text>
+                      <Text style={styles.tableCell}>{valResult.targetF1.toFixed(2)}</Text>
+                    </View>
+                  );
+                })}
+              </View>
+            </ScrollView>
           </View>
         )}
       </View>
@@ -586,17 +840,35 @@ export default function AICalibrationLabScreen({ onBack }) {
                 <View style={styles.resultBox}>
                   <Text style={styles.resultTitle}>Before → After</Text>
                   <Text style={styles.resultLine}>
+                    Target F1 (alarm+knock): {retestResult.before.targetF1.toFixed(2)} → {retestResult.after.targetF1.toFixed(2)}
+                  </Text>
+                  <Text style={styles.resultLine}>
+                    ALARM Recall: {retestResult.before.perClass.alarm.recall.toFixed(2)} → {retestResult.after.perClass.alarm.recall.toFixed(2)}
+                  </Text>
+                  <Text style={styles.resultLine}>
+                    KNOCK Recall: {retestResult.before.perClass.knock.recall.toFixed(2)} → {retestResult.after.perClass.knock.recall.toFixed(2)}
+                  </Text>
+                  <Text style={styles.resultLine}>
                     False Positives: {retestResult.before.totalFP} → {retestResult.after.totalFP}
                   </Text>
                   <Text style={styles.resultLine}>
                     False Negatives: {retestResult.before.totalFN} → {retestResult.after.totalFN}
                   </Text>
-                  <TouchableOpacity
-                    style={styles.acceptButton}
-                    onPress={() => handleAdoptConfiguration(retestResult.candidate, 'بعد Retest مع توصيات Gemini')}
-                  >
-                    <Text style={styles.buttonText}>✅ اعتماد الإعداد بعد Retest</Text>
-                  </TouchableOpacity>
+
+                  {retestResult.after.targetF1 < MIN_ADOPTABLE_F1 ||
+                  retestResult.after.perClass.alarm.recall === 0 ||
+                  retestResult.after.perClass.knock.recall === 0 ? (
+                    <Text style={styles.warningText}>
+                      🚫 زر الاعتماد معطَّل: هذا الإعداد بعد Retest لا يحقق حدًا أدنى مقبولاً من Target F1/Recall. جرّب Reject على توصية والاختبار مجددًا.
+                    </Text>
+                  ) : (
+                    <TouchableOpacity
+                      style={styles.acceptButton}
+                      onPress={() => handleAdoptConfiguration(retestResult.candidate, 'بعد Retest مع توصيات Gemini')}
+                    >
+                      <Text style={styles.buttonText}>✅ اعتماد الإعداد بعد Retest</Text>
+                    </TouchableOpacity>
+                  )}
                 </View>
               )}
             </View>
@@ -645,6 +917,25 @@ const styles = StyleSheet.create({
   buttonText: { color: '#fff', fontSize: 14, fontWeight: '600' },
   secondaryButtonText: { color: '#f87171', fontSize: 14 },
   resultBox: { backgroundColor: '#161f30', borderRadius: 10, padding: 14, marginTop: 8, borderWidth: 1, borderColor: '#2563eb' },
+  diagnosticsHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  diagnosticsToggle: { color: '#93c5fd', fontSize: 16, paddingHorizontal: 8 },
+  diagnosticsLabelBlock: { marginTop: 12, paddingTop: 8, borderTopWidth: 1, borderTopColor: '#243044' },
+  diagStatsRow: { marginTop: 8 },
+  diagFeatureName: { color: '#93c5fd', fontSize: 12, fontWeight: '700', marginBottom: 4 },
+  diagStatsValuesRow: { flexDirection: 'row' },
+  diagStatCell: { alignItems: 'center', width: 58, paddingVertical: 2 },
+  diagStatCellLabel: { color: '#888', fontSize: 10 },
+  diagStatCellValue: { color: '#ddd', fontSize: 12, fontWeight: '600' },
+  matrixHeaderRow: { flexDirection: 'row', marginTop: 4 },
+  matrixRow: { flexDirection: 'row', alignItems: 'center' },
+  matrixCellHeader: { color: '#93c5fd', fontSize: 11, width: 56, textAlign: 'center', fontWeight: '700' },
+  matrixCellLabel: { color: '#93c5fd', fontSize: 11, width: 56, fontWeight: '700' },
+  matrixCell: { color: '#ddd', fontSize: 12, width: 56, textAlign: 'center', paddingVertical: 2 },
+  matrixCellDiagonal: { color: '#4ade80', fontWeight: '700' },
+  tableHeaderRow: { flexDirection: 'row', borderBottomWidth: 1, borderBottomColor: '#333', paddingBottom: 4, marginBottom: 4 },
+  tableHeaderCell: { color: '#93c5fd', fontSize: 11, width: 52, textAlign: 'center', fontWeight: '700' },
+  tableRow: { flexDirection: 'row', paddingVertical: 3 },
+  tableCell: { color: '#ddd', fontSize: 11, width: 52, textAlign: 'center' },
   resultTitle: { color: '#fff', fontSize: 14, fontWeight: '700', marginBottom: 6 },
   resultSubtitle: { color: '#93c5fd', fontSize: 12, marginTop: 8, marginBottom: 4 },
   resultLine: { color: '#ddd', fontSize: 13, marginBottom: 2 },
